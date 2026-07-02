@@ -117,7 +117,7 @@ public class NetworkThread implements Runnable {
         // offer() instead of put() so a full queue never blocks the receive loop
         // and stalls UDP reads (which would just cause more packet loss).
         if (!frameBuffer.offer(frame)) {
-            System.err.println("Frame queue full, dropping frame");
+            //System.err.println("Frame queue full, dropping frame");
         }
  
         // reset so a duplicate/late packet for this frame index can't be mistaken for a new one

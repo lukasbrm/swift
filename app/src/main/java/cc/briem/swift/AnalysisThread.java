@@ -6,7 +6,9 @@ import java.util.concurrent.BlockingQueue;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import cc.briem.swift.cv.models.LandmarkResult;
 import cc.briem.swift.network.models.Frame;
+
 import javafx.application.Platform;
 import javafx.scene.image.Image;
 
@@ -14,30 +16,29 @@ public class AnalysisThread implements Runnable {
 
     private static final Logger logger = LoggerFactory.getLogger(AnalysisThread.class);
 
-    private final BlockingQueue<Frame> frameBuffer;
+    private final BlockingQueue<Frame> analyzedFrames;
+    private final BlockingQueue<LandmarkResult> landmarkResults;
 
-    public AnalysisThread(BlockingQueue<Frame> frameBuffer) {
-        this.frameBuffer = frameBuffer;
+    public AnalysisThread(BlockingQueue<Frame> analyzedFrames, BlockingQueue<LandmarkResult> landmarkResults) {
+        this.analyzedFrames = analyzedFrames;
+        this.landmarkResults = landmarkResults;
     }
 
     @Override
     public void run() {
-
         logger.info("AnalysisThread starting...");
 
         while (!Thread.currentThread().isInterrupted()) {
             try {
-                Frame frame = frameBuffer.take(); // blocks until a frame is available
+                Frame frame = analyzedFrames.take();
+                analyzedFrames.clear(); // drop backlog, always display the latest frame
 
-                // Convert byte data to Image
                 Image image = new Image(new ByteArrayInputStream(frame.getJpegData()));
 
-                // Update the ImageView on the JavaFX Application Thread
-                Platform.runLater(() -> {
-                    if (DisplayApp.imageView != null) {
-                        DisplayApp.imageView.setImage(image);
-                    }
-                });
+                LandmarkResult result = landmarkResults.poll();
+                landmarkResults.clear(); // keep in sync with frame backlog drop above
+
+                Platform.runLater(() -> DisplayApp.render(image, result));
 
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
