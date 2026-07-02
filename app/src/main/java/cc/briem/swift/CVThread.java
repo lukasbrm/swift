@@ -48,7 +48,6 @@ public class CVThread implements Runnable {
                 LandmarkResult result = pipeline.process(frame);
                 landmarkResults.offer(result);
                 analyzedFrames.offer(frame);
-                logger.debug(result.toString());
                 }
             }
 

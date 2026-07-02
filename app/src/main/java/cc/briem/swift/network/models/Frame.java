@@ -3,24 +3,25 @@ package cc.briem.swift.network.models;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.time.Instant;
 
 import javax.imageio.ImageIO;
 
 public class Frame {
     
     private final byte[] jpegData;
-    private final long timestamp;
+    private final Instant timestamp;
 
     public Frame(byte[] jpegData) {
         this.jpegData = jpegData;
-        this.timestamp = System.currentTimeMillis();
+        this.timestamp = Instant.now();
     }
 
     public byte[] getJpegData() {
         return jpegData;
     }
 
-    public long getTimestamp() {
+    public Instant getTimestamp() {
         return timestamp;
     }
 

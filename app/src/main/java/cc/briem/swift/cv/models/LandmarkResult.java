@@ -1,22 +1,23 @@
 package cc.briem.swift.cv.models;
 
+import java.time.Instant;
 import java.util.List;
 
 public class LandmarkResult {
 
     private final List<HandLandmarks> hands;
-    private final double timestamp;
+    private final Instant timestamp;
 
     public LandmarkResult(List<HandLandmarks> hands) {
         this.hands = hands;
-        this.timestamp = System.currentTimeMillis();
+        this.timestamp = Instant.now();
     }
 
     public List<HandLandmarks> getHands() {
         return hands;
     }
 
-    public double getTimestamp() {
+    public Instant getTimestamp() {
         return timestamp;
     }
 

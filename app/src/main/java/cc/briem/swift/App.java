@@ -4,6 +4,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 
 import cc.briem.swift.cv.models.LandmarkResult;
+import cc.briem.swift.imu.IMUController;
 import cc.briem.swift.network.models.Frame;
 import javafx.application.Application;
 
@@ -14,6 +15,9 @@ public class App {
         BlockingQueue<Frame> frameBuffer = new LinkedBlockingQueue<>(64);
         BlockingQueue<Frame> analyzedFrames = new LinkedBlockingQueue<>(64);
         BlockingQueue<LandmarkResult> landmarkResults = new LinkedBlockingQueue<>(64);
+
+        // Instantiate IMUController for global access
+        IMUController imuController = new IMUController("/dev/tty.usbserial-210", 115200);
 
         // Start network thread (receives frames)
         NetworkThread networkThreadRunnable = new NetworkThread(frameBuffer);
@@ -28,13 +32,13 @@ public class App {
         cvThread.start();
 
         // Start IMU thread
-        IMUThread imuThreadRunnable = new IMUThread(frameBuffer);
+        IMUThread imuThreadRunnable = new IMUThread(imuController);
         Thread imuThread = new Thread(imuThreadRunnable, "IMU Thread");
         imuThread.setDaemon(true);
         imuThread.start();
 
         // Start Analysis thread (consumes frames and updates the JavaFX UI)
-        AnalysisThread analysisThreadRunnable = new AnalysisThread(analyzedFrames, landmarkResults);
+        AnalysisThread analysisThreadRunnable = new AnalysisThread(analyzedFrames, landmarkResults, imuController);
         Thread analysisThread = new Thread(analysisThreadRunnable, "Analysis Thread");
         analysisThread.setDaemon(true);
         analysisThread.start();

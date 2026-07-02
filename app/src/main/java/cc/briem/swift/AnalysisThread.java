@@ -1,8 +1,11 @@
 package cc.briem.swift;
 
 import java.io.ByteArrayInputStream;
+import java.time.Instant;
 import java.util.concurrent.BlockingQueue;
 
+import cc.briem.swift.imu.IMUController;
+import cc.briem.swift.imu.ImuPacket;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -18,10 +21,12 @@ public class AnalysisThread implements Runnable {
 
     private final BlockingQueue<Frame> analyzedFrames;
     private final BlockingQueue<LandmarkResult> landmarkResults;
+    private final IMUController imuController;
 
-    public AnalysisThread(BlockingQueue<Frame> analyzedFrames, BlockingQueue<LandmarkResult> landmarkResults) {
+    public AnalysisThread(BlockingQueue<Frame> analyzedFrames, BlockingQueue<LandmarkResult> landmarkResults, IMUController imuController) {
         this.analyzedFrames = analyzedFrames;
         this.landmarkResults = landmarkResults;
+        this.imuController = imuController;
     }
 
     @Override
@@ -30,15 +35,21 @@ public class AnalysisThread implements Runnable {
 
         while (!Thread.currentThread().isInterrupted()) {
             try {
+                // Take frame
                 Frame frame = analyzedFrames.take();
                 analyzedFrames.clear(); // drop backlog, always display the latest frame
 
                 Image image = new Image(new ByteArrayInputStream(frame.getJpegData()));
 
-                LandmarkResult result = landmarkResults.poll();
+                // Predict landmarks from frame
+                LandmarkResult landmarkResult = landmarkResults.poll();
                 landmarkResults.clear(); // keep in sync with frame backlog drop above
 
-                Platform.runLater(() -> DisplayApp.render(image, result));
+                // Get IMU angle data at frame time
+                ImuPacket.Angle anglePacket = imuController.getImuAt(Instant.now(), ImuPacket.Angle.class).get();
+
+
+                Platform.runLater(() -> DisplayApp.render(image, landmarkResult, anglePacket));
 
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
