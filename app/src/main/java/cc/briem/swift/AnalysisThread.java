@@ -135,6 +135,12 @@ public class AnalysisThread implements Runnable {
          * Unscented or Extended Kalman Filter for 3D movement (nonlinear)
          *
          * EKF vs. UKF = Calculus vs. Statistics (sampling)
+         *
+         * UKF: Higher accuracy during intense movements, easier to implement <-- Choose this
+         *
+         * Only evaluate / modify Landmark 0 (Wrist) : Too much load
+         * --> IMU angular velocity does not matter then ( can just be applied )
+         * ==> 6 Dimensional Data Points
          */
         return null;
     }
