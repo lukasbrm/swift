@@ -17,6 +17,10 @@ public class LandmarkResult {
         return hands;
     }
 
+    public void setFirstHandLandmarks(HandLandmarks landmarks) {
+        hands.set(0, landmarks);
+    }
+
     public Instant getTimestamp() {
         return timestamp;
     }

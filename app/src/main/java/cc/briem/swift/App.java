@@ -17,7 +17,7 @@ public class App {
         BlockingQueue<LandmarkResult> landmarkResults = new LinkedBlockingQueue<>(64);
 
         // Instantiate IMUController for global access
-        IMUController imuController = new IMUController("/dev/tty.usbserial-210", 115200);
+        IMUController imuController = new IMUController("/dev/tty.usbserial-10", 115200);
 
         // Start network thread (receives frames)
         NetworkThread networkThreadRunnable = new NetworkThread(frameBuffer);
