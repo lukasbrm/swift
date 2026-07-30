@@ -97,13 +97,14 @@ public class LandmarkPredictor implements AutoCloseable {
         try (OnnxTensor inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(inputData), shape)) {
             Map<String, OnnxTensor> inputs = Collections.singletonMap(INPUT_NAME, inputTensor);
             try (OrtSession.Result result = session.run(inputs)) {
-                float[] rawLandmarks = ((float[][]) result.get(LANDMARKS_OUTPUT).get().getValue())[0];
-                float conf = ((float[][]) result.get(CONF_OUTPUT).get().getValue())[0][0];
-                float handedness = ((float[][]) result.get(HANDEDNESS_OUTPUT).get().getValue())[0][0];
+                float[] rawLandmarks      = ((float[][]) result.get(LANDMARKS_OUTPUT).get().getValue())[0];
+                float   conf              = ((float[][]) result.get(CONF_OUTPUT).get().getValue())[0][0];
+                float   handedness        = ((float[][]) result.get(HANDEDNESS_OUTPUT).get().getValue())[0][0];
+                float[] rawWorldLandmarks = ((float[][]) result.get(LANDMARKS_WORLD_OUTPUT).get().getValue())[0];
 
                 if (conf < CONF_THRESHOLD) return null;
 
-                return postprocess(rawLandmarks, conf, handedness, step2.box, angleDeg, rotMatrix, step1.bias);
+                return postprocess(rawLandmarks, rawWorldLandmarks, conf, handedness, step2.box, angleDeg, rotMatrix, step1.bias);
             }
         }
     }
@@ -122,7 +123,8 @@ public class LandmarkPredictor implements AutoCloseable {
         return data;
     }
 
-    private HandLandmarks postprocess(float[] rawLandmarks, float conf, float handedness,
+    private HandLandmarks postprocess(float[] rawLandmarks, float[] rawWorldLandmarks,
+                                       float conf, float handedness,
                                        double[] rotatedPalmBboxFinal, double angleDeg,
                                        AffineUtil.Mat2x3 rotMatrix, double[] padBias) {
         double whX = rotatedPalmBboxFinal[2] - rotatedPalmBboxFinal[0];
@@ -154,7 +156,36 @@ public class LandmarkPredictor implements AutoCloseable {
             points.add(new Point3D(finalX, finalY, z));
         }
 
-        return new HandLandmarks(points, handedness, conf);
+        // World landmarks: metric 3D coordinates with origin at wrist, directly from the model.
+        // X right, Y up, Z toward camera — this is our target convention (matching the rest of
+        // the codebase, e.g. AnalysisThread's world/IMU frame), NOT the model's native output.
+        //
+        // The model sees the hand rotated upright (by angleDeg, for a consistent input pose), so
+        // its raw output — for both screen and world landmarks — is expressed in that rotated
+        // frame. Screen landmarks get that rotation undone above (coordsRot) before being placed
+        // back in image space; per the reference implementation (opencv_zoo's mp_handpose.py),
+        // world landmarks need the same X/Y rotation-undo (but no translation, since they aren't
+        // pixel-anchored) — otherwise they stay rotated by an arbitrary per-frame angle relative
+        // to the camera frame instead of representing the hand's true orientation.
+        //
+        // The model's raw Y (both before and after that rotation-undo) is image-style (increases
+        // downward), not "Y up" — confirmed by testing (landmarks rendered upside-down without
+        // this flip) and consistent with the reference demo drawing landmarks_word's X/Y straight
+        // onto an image canvas with no negation. Negate it here so worldPoints actually matches
+        // its documented Y-up contract.
+        List<Point3D> worldPoints = new ArrayList<>(21);
+        for (int i = 0; i < 21; i++) {
+            double wx = rawWorldLandmarks[i * 3];
+            double wy = rawWorldLandmarks[i * 3 + 1];
+            double wz = rawWorldLandmarks[i * 3 + 2];
+
+            double rotWx = wx * coordsRot.m00 + wy * coordsRot.m10;
+            double rotWy = wx * coordsRot.m01 + wy * coordsRot.m11;
+
+            worldPoints.add(new Point3D(rotWx, -rotWy, wz));
+        }
+
+        return new HandLandmarks(points, worldPoints, handedness, conf);
     }
 
     private static class CropResult {

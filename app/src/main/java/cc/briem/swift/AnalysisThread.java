@@ -1,10 +1,14 @@
 package cc.briem.swift;
 
 import java.io.ByteArrayInputStream;
+import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 import cc.briem.swift.cv.models.HandLandmarks;
 import cc.briem.swift.imu.IMUController;
@@ -38,6 +42,20 @@ public class AnalysisThread implements Runnable {
     HandLandmarks previousFilteredFrame = null;
     float alpha = 0.8f;
 
+    // Kalman fusion state (wrist only — see kalmanFuse)
+    private UKF.WristFilter wristFilter;
+    private Instant lastPredictTime;
+    private List<Point3D> referenceOffsets;   // points 0..20 minus wrist, metric world frame, from the last confident CV frame
+    private ImuPacket.Angle referenceAngle;   // IMU orientation captured alongside referenceOffsets
+    private double lastDepthScale;            // pixel->metric depth scale from the last confident CV frame, reused during occlusion
+    private List<Point3D> lastWorldPoints;
+    private double lastHandednessScore;
+    private double lastPresenceScore;
+
+    private static final long PREDICT_TICK_MS = 10;        // ~100Hz predict/render tick, decoupled from actual IMU/CV rates
+    private static final double PRESENCE_THRESHOLD = 0.5;  // gate for treating a CV frame as "confident"
+    private static final double GRAVITY_MPS2 = 9.80665;
+
     public AnalysisThread(BlockingQueue<Frame> analyzedFrames, BlockingQueue<LandmarkResult> landmarkResults, IMUController imuController) {
         this.analyzedFrames = analyzedFrames;
         this.landmarkResults = landmarkResults;
@@ -50,44 +68,58 @@ public class AnalysisThread implements Runnable {
 
         while (!Thread.currentThread().isInterrupted()) {
             try {
-                // Take frame
-                Frame frame = analyzedFrames.take();
-                analyzedFrames.clear(); // drop backlog, always display the latest frame
+                // Tick at a fixed, high rate so IMU-driven prediction isn't gated on CV frame
+                // arrival (analyzedFrames.take() would only wake up at CV cadence, ~30Hz).
+                Frame frame = analyzedFrames.poll(PREDICT_TICK_MS, TimeUnit.MILLISECONDS);
+                if (frame != null) {
+                    analyzedFrames.clear(); // drop backlog, always display the latest frame
+                }
+
+                // Get IMU data at tick time
+                Instant now = Instant.now();
+                Optional<ImuPacket.Acceleration> accelPacket = imuController.getImuAt(now, ImuPacket.Acceleration.class);
+                Optional<ImuPacket.Angle> anglePacketOpt = imuController.getImuAt(now, ImuPacket.Angle.class);
+                Optional<ImuPacket.Gyro> gyroPacket = imuController.getImuAt(now, ImuPacket.Gyro.class);
+                if (accelPacket.isEmpty() || anglePacketOpt.isEmpty() || gyroPacket.isEmpty()) {
+                    continue; // IMU hasn't produced its first packet(s) of every type yet
+                }
+                ImuPacket.Angle anglePacket = anglePacketOpt.get();
+                ImuPacket[] imuPackets = new ImuPacket[3];
+                imuPackets[0] = accelPacket.get();
+                imuPackets[1] = anglePacket;
+                imuPackets[2] = gyroPacket.get();
+
+                // Predict landmarks from frame, if one arrived this tick
+                LandmarkResult landmarkResult = null;
+                HandLandmarks rawHand = null;
+                if (frame != null) {
+                    landmarkResult = landmarkResults.poll();
+                    landmarkResults.clear(); // keep in sync with frame backlog drop above
+                    if (landmarkResult != null && !landmarkResult.getHands().isEmpty()) {
+                        rawHand = landmarkResult.getHands().getFirst();
+                    }
+                }
+
+                // Kalman-fuse the wrist: CV is absolute truth when confident, IMU carries the
+                // estimate between frames / through occlusion. Runs every tick (predict), and
+                // additionally corrects (update) whenever a confident CV frame is present.
+                // Replaces the old lowPass/movingAverage chain (kept below, unused, for reference).
+                HandLandmarks fused = kalmanFuse(imuPackets, rawHand);
+
+                if (frame == null || landmarkResult == null) {
+                    continue; // no new image this tick — nothing to (re)render
+                }
+
+                List<HandLandmarks> hands = landmarkResult.getHands();
+                if (fused != null) {
+                    if (hands.isEmpty()) {
+                        hands.add(fused);
+                    } else {
+                        landmarkResult.setFirstHandLandmarks(fused);
+                    }
+                }
 
                 Image image = new Image(new ByteArrayInputStream(frame.getJpegData()));
-
-                // Get IMU data at frame time
-                Instant now = Instant.now();
-                ImuPacket.Acceleration accelPacket = imuController.getImuAt(now, ImuPacket.Acceleration.class).get();
-                ImuPacket.Angle anglePacket = imuController.getImuAt(now, ImuPacket.Angle.class).get();
-                ImuPacket.Gyro gyroPacket = imuController.getImuAt(now, ImuPacket.Gyro.class).get();
-                ImuPacket[] imuPackets = new ImuPacket[3];
-                imuPackets[0] = accelPacket;
-                imuPackets[1] = anglePacket;
-                imuPackets[2] = gyroPacket;
-
-                // Predict landmarks from frame
-                LandmarkResult landmarkResult = landmarkResults.poll();
-                landmarkResults.clear(); // keep in sync with frame backlog drop above
-                if(landmarkResult == null) continue;
-                List<HandLandmarks> hands = landmarkResult.getHands();
-
-                // -- PROCESS ENDS HERE WHEN NO FRAME --
-
-                // Filter chain
-                if (!hands.isEmpty()) {
-                    // Moving Average of Landmarks
-                    //HandLandmarks moving = movingAverage(hands.getFirst());
-
-                    // Low Pass Filter
-                    HandLandmarks filtered = lowPassFilter(hands.getFirst());
-
-                    // Set Results
-                    landmarkResult.setFirstHandLandmarks(filtered);
-                    hands.set(0, filtered);
-                } else {
-                    resetMovingAvgBuffer();
-                }
 
                 // Calculate palm normals
                 Point3D[] imuNormal = new Point3D[2];
@@ -107,16 +139,8 @@ public class AnalysisThread implements Runnable {
                 double vectorAngle = angleBetween(imuNormal[0], geometricNormal[0]);
                 TrackingState state = getTrackingState(geometricNormal[0], imuNormal[0]);
 
-                // Calculate moving Average of HandLandmarks
-                if (!hands.isEmpty()) {
-                    HandLandmarks moving = movingAverage(hands.getFirst());
-                    landmarkResult.setFirstHandLandmarks(moving);
-                } else {
-                    resetMovingAvgBuffer();
-                }
-
-
-                Platform.runLater(() -> DisplayApp.render(image, landmarkResult, imuNormal, geometricNormal, state));
+                final LandmarkResult resultForRender = landmarkResult;
+                Platform.runLater(() -> DisplayApp.render(image, resultForRender, imuNormal, geometricNormal, state));
 
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -126,6 +150,7 @@ public class AnalysisThread implements Runnable {
     }
 
     private HandLandmarks kalmanFuse(ImuPacket[] imuPackets, HandLandmarks handLandmarks) {
+
         /** What kalman does:
          *
          * - CV Frame (when visible) is absolute truth
@@ -142,7 +167,149 @@ public class AnalysisThread implements Runnable {
          * --> IMU angular velocity does not matter then ( can just be applied )
          * ==> 6 Dimensional Data Points
          */
-        return null;
+
+        ImuPacket.Acceleration accel = (ImuPacket.Acceleration) imuPackets[0];
+        ImuPacket.Angle angle = (ImuPacket.Angle) imuPackets[1];
+        // imuPackets[2] (gyro) is intentionally unused — the rest of the hand is rotated
+        // statically from the absolute Angle packet each tick, not integrated from angular velocity.
+
+        Instant now = Instant.now();
+
+        Point3D wristWorld = null;
+        double depthScale = 0.0;
+        if (handLandmarks != null) {
+            depthScale = computeDepthScale(handLandmarks);
+            if (depthScale > 0.0) {
+                wristWorld = computeWristWorldPosition(handLandmarks, depthScale);
+            }
+        }
+        boolean confident = wristWorld != null && handLandmarks.presenceScore >= PRESENCE_THRESHOLD;
+
+        if (wristFilter == null) {
+            if (!confident) {
+                return null; // nothing to bootstrap the filter from yet
+            }
+            wristFilter = new UKF.WristFilter(wristWorld);
+            captureReferenceShape(handLandmarks, angle, depthScale);
+            lastPredictTime = now;
+            return reprojectHand(wristFilter.getPosition(), angle);
+        }
+
+        double dt = (lastPredictTime == null) ? 0.0 : Duration.between(lastPredictTime, now).toNanos() / 1_000_000_000.0;
+        lastPredictTime = now;
+        if (dt > 0.0) {
+            wristFilter.predict(dt, sensorAccelerationMps2(accel), worldRotationMatrix(angle));
+        }
+
+        if (confident) {
+            wristFilter.update(wristWorld);
+            captureReferenceShape(handLandmarks, angle, depthScale);
+        }
+
+        return reprojectHand(wristFilter.getPosition(), angle);
+    }
+
+    /**
+     * Standard pinhole back-projection of the wrist's own pixel position, using {@code depthScale}
+     * (from {@link #computeDepthScale}) as its absolute camera-to-wrist distance in metres.
+     *
+     * <p>Deliberately does NOT use {@link UKF#toWorldCoordinates} here: that helper multiplies each
+     * landmark's own {@code z} by depthScale, but MediaPipe defines landmark 0's z relative to
+     * itself (≈0, since the wrist is the depth *reference*) — so its output for the wrist is always
+     * a noise-dominated point near the origin, regardless of where the wrist actually is. Using the
+     * palm-width-derived depthScale directly as the wrist's absolute Z avoids that degeneracy.
+     */
+    private static Point3D computeWristWorldPosition(HandLandmarks pixelHand, double depthScale) {
+        Point3D wristPixel = pixelHand.points.get(0);
+        double zCam = depthScale;
+        double xCam = (wristPixel.getX() - UKF.CameraIntrinsics.MBP.cx()) / UKF.CameraIntrinsics.MBP.fx() * zCam;
+        double yCam = (wristPixel.getY() - UKF.CameraIntrinsics.MBP.cy()) / UKF.CameraIntrinsics.MBP.fy() * zCam;
+        return new Point3D(xCam, -yCam, -zCam);
+    }
+
+    /**
+     * Caches the wrist-relative offsets + IMU orientation + depth scale of a confident CV frame.
+     *
+     * <p>Offsets come from {@code handLandmarks.worldPoints} — MediaPipe's own native metric hand
+     * pose (already correct and already in the X-right/Y-up/Z-toward-camera convention used
+     * throughout this class) — rather than from {@link UKF#toWorldCoordinates}, whose per-point
+     * math has the same self-relative-z issue described in {@link #computeWristWorldPosition}.
+     */
+    private void captureReferenceShape(HandLandmarks handLandmarks, ImuPacket.Angle angle, double depthScale) {
+        Point3D wristOrigin = handLandmarks.worldPoints.get(0);
+        List<Point3D> offsets = new ArrayList<>(handLandmarks.worldPoints.size());
+        for (Point3D p : handLandmarks.worldPoints) {
+            offsets.add(p.subtract(wristOrigin));
+        }
+        this.referenceOffsets = offsets;
+        this.referenceAngle = angle;
+        this.lastDepthScale = depthScale;
+        this.lastWorldPoints = handLandmarks.worldPoints;
+        this.lastHandednessScore = handLandmarks.handednessScore;
+        this.lastPresenceScore = handLandmarks.presenceScore;
+    }
+
+    /**
+     * Rigidly rotates the cached reference hand shape by however much the IMU orientation has
+     * changed since it was captured, anchors it at the fused wrist position, and projects the
+     * result back to image pixel coordinates (the frame the rest of the pipeline — DisplayApp,
+     * geometricNormal — expects {@code HandLandmarks.points} to be in).
+     */
+    private HandLandmarks reprojectHand(Point3D fusedWristWorld, ImuPacket.Angle angle) {
+        if (referenceOffsets == null) {
+            return null;
+        }
+
+        double[][] delta = multiply3x3(worldRotationMatrix(angle), transpose3x3(worldRotationMatrix(referenceAngle)));
+
+        List<Point3D> pixelPoints = new ArrayList<>(referenceOffsets.size());
+        for (Point3D offset : referenceOffsets) {
+            Point3D worldPoint = fusedWristWorld.add(applyMatrix(delta, offset));
+            pixelPoints.add(toPixelSpace(worldPoint, lastDepthScale));
+        }
+
+        return new HandLandmarks(pixelPoints, lastWorldPoints, lastHandednessScore, lastPresenceScore);
+    }
+
+    /**
+     * Raw accelerometer packet converted to sensor-frame specific force (m/s^2). Rotation into
+     * world frame, gravity compensation, and accelerometer-bias cancellation all now happen
+     * inside {@link UKF.WristFilter}'s process model instead of here, since the bias correction
+     * must be applied per-sigma-point (using that sigma point's own bias hypothesis) for the
+     * filter to be able to observe and estimate the bias at all.
+     *
+     * <p>The raw vector is negated: on this hardware, the at-rest reading maps (via {@code M})
+     * to the opposite of what was first assumed, which left gravity doubling instead of
+     * cancelling (~2g of constant phantom downward acceleration) — confirmed by on-device testing
+     * showing a fast, consistent downward drift between CV corrections.
+     */
+    private static Point3D sensorAccelerationMps2(ImuPacket.Acceleration accel) {
+        return new Point3D(accel.ax(), accel.ay(), accel.az()).multiply(-GRAVITY_MPS2);
+    }
+
+    /** Mirrors UKF.toWorldCoordinates' internal depth-scale calc (landmarks 0 and 9 = its PALM_REF_A/B). */
+    private static double computeDepthScale(HandLandmarks pixelHand) {
+        Point3D refA = pixelHand.points.get(0);
+        Point3D refB = pixelHand.points.get(9);
+        double dx = refB.getX() - refA.getX();
+        double dy = refB.getY() - refA.getY();
+        double palmWidthPx = Math.sqrt(dx * dx + dy * dy);
+        if (palmWidthPx == 0.0) return 0.0;
+        return (UKF.DEFAULT_PALM_WIDTH_METRES * UKF.CameraIntrinsics.MBP.fx()) / palmWidthPx;
+    }
+
+    /** Inverse of {@link UKF#toWorldCoordinates}: projects a metric world point back to image pixels. */
+    private static Point3D toPixelSpace(Point3D worldPoint, double depthScale) {
+        double xCam = worldPoint.getX();
+        double yCam = -worldPoint.getY();
+        double zCam = -worldPoint.getZ();
+        if (depthScale <= 0.0 || zCam == 0.0) {
+            return new Point3D(UKF.CameraIntrinsics.MBP.cx(), UKF.CameraIntrinsics.MBP.cy(), 0);
+        }
+        double u = xCam / zCam * UKF.CameraIntrinsics.MBP.fx() + UKF.CameraIntrinsics.MBP.cx();
+        double v = yCam / zCam * UKF.CameraIntrinsics.MBP.fy() + UKF.CameraIntrinsics.MBP.cy();
+        double zPixel = zCam / depthScale;
+        return new Point3D(u, v, zPixel);
     }
 
     private HandLandmarks movingAverage(HandLandmarks newFrame) {
@@ -243,6 +410,16 @@ public class AnalysisThread implements Runnable {
      * @return unit normal vector in world coordinates
      */
     public static Point3D imuNormal(ImuPacket.Angle angle) {
+        return rotateSensorToWorld(new Point3D(0, 0, -1), angle);
+    }
+
+    /**
+     * Full sensor-to-world rotation matrix {@code M * R(roll,pitch,yaw)}, generalizing the
+     * {@code n_world = M * R * (0,0,-1)} formula above to arbitrary sensor-frame vectors
+     * (used both for {@link #imuNormal} and to rotate IMU acceleration / the rest of the
+     * hand's landmarks into world coordinates in {@code kalmanFuse}).
+     */
+    private static double[][] worldRotationMatrix(ImuPacket.Angle angle) {
         double r = Math.toRadians(angle.roll());
         double p = Math.toRadians(angle.pitch());
         double y = Math.toRadians(angle.yaw());
@@ -251,17 +428,49 @@ public class AnalysisThread implements Runnable {
         double sp = Math.sin(p), cp = Math.cos(p);
         double sy = Math.sin(y), cy = Math.cos(y);
 
-        // R * (0,0,-1) = negated third column of Rz(y)*Ry(p)*Rx(r)
-        double vx = -(cy * sp * cr + sy * sr);
-        double vy = -(sy * sp * cr - cy * sr);
-        double vz = -(cp * cr);
+        // R = Rz(yaw) * Ry(pitch) * Rx(roll)
+        double[][] rot = {
+                { cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr },
+                { sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr },
+                { -sp,     cp * sr,                cp * cr                }
+        };
 
-        // n_world = M * v
-        double nx = M[0][0] * vx + M[0][1] * vy + M[0][2] * vz;
-        double ny = M[1][0] * vx + M[1][1] * vy + M[1][2] * vz;
-        double nz = M[2][0] * vx + M[2][1] * vy + M[2][2] * vz;
+        return multiply3x3(M, rot);
+    }
 
-        return new Point3D(nx, ny, nz);
+    private static Point3D rotateSensorToWorld(Point3D sensorVec, ImuPacket.Angle angle) {
+        return applyMatrix(worldRotationMatrix(angle), sensorVec);
+    }
+
+    private static Point3D applyMatrix(double[][] mat, Point3D v) {
+        double x = v.getX(), y = v.getY(), z = v.getZ();
+        return new Point3D(
+                mat[0][0] * x + mat[0][1] * y + mat[0][2] * z,
+                mat[1][0] * x + mat[1][1] * y + mat[1][2] * z,
+                mat[2][0] * x + mat[2][1] * y + mat[2][2] * z
+        );
+    }
+
+    private static double[][] multiply3x3(double[][] a, double[][] b) {
+        double[][] out = new double[3][3];
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                double sum = 0;
+                for (int k = 0; k < 3; k++) sum += a[i][k] * b[k][j];
+                out[i][j] = sum;
+            }
+        }
+        return out;
+    }
+
+    private static double[][] transpose3x3(double[][] a) {
+        double[][] out = new double[3][3];
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                out[j][i] = a[i][j];
+            }
+        }
+        return out;
     }
 
     /**
