@@ -23,10 +23,16 @@ import com.fazecast.jSerialComm.SerialPort;
  * <p>The WIT protocol uses fixed 11-byte packets:
  * <pre>
  *   [0]  0x55        – start byte
- *   [1]  type        – 0x51 accel | 0x52 gyro | 0x53 angle | 0x54 magnetic
+ *   [1]  type        – 0x51 accel | 0x52 gyro | 0x54 magnetic | 0x59 quaternion
  *   [2–9] payload    – 4 × signed 16-bit little-endian values
  *   [10] checksum    – lower 8 bits of sum of bytes 0–9
  * </pre>
+ *
+ * <p>{@link ImuPacket.Angle} (roll/pitch/yaw) is no longer read from the sensor's native
+ * 0x53 angle packet. Instead {@link #open()} switches the sensor's output register to emit
+ * quaternion (0x59) packets, and every quaternion received is converted to roll/pitch/yaw
+ * ({@link #parseAngleFromQuaternion}) so the rest of this class — history, {@link #getImuAt}
+ * — is unaffected by the change.
  *
  * <p>Usage:
  * <pre>{@code
@@ -44,14 +50,33 @@ public class IMUController implements AutoCloseable {
     private static final byte   START_BYTE    = 0x55;
     private static final byte   TYPE_ACCEL    = 0x51;
     private static final byte   TYPE_GYRO     = 0x52;
-    private static final byte   TYPE_ANGLE    = 0x53;
     private static final byte   TYPE_MAGNETIC = 0x54;
+    private static final byte   TYPE_QUAT     = 0x59;
     private static final int    PACKET_SIZE   = 11;
+
+    /**
+     * WIT "unlock" command ({@code FF AA 69 88 B5}), register 0x69. Many WIT firmwares
+     * silently reject writes to configuration registers (RSW included) unless this is sent
+     * first — there is no separate error for a rejected write, it just keeps the old
+     * configuration, which is what made this so easy to misdiagnose as "the command never
+     * arrived".
+     */
+    private static final byte[] CMD_UNLOCK =
+            { (byte) 0xFF, (byte) 0xAA, 0x69, (byte) 0x88, (byte) 0xB5 };
+
+    /**
+     * WIT "RSW" output-content command: {@code FF AA 02 <maskLo> <maskHi>}.
+     * Mask 0x0206 = acceleration (bit1, 0x02) | angular velocity (bit2, 0x04)
+     * | quaternion (bit9, 0x200). Written on every {@link #open()} (RAM only, no
+     * {@code SAVE} command) so no EEPROM wear accrues across restarts.
+     */
+    private static final byte[] CMD_RSW_ACCEL_GYRO_QUAT =
+            { (byte) 0xFF, (byte) 0xAA, 0x02, 0x06, 0x02 };
 
     // Scaling factors from the WIT datasheet
     private static final double ACCEL_SCALE   = 16.0   / 32768.0;  // g per LSB
     private static final double GYRO_SCALE    = 2000.0 / 32768.0;  // °/s per LSB
-    private static final double ANGLE_SCALE   = 180.0  / 32768.0;  // ° per LSB
+    private static final double QUAT_SCALE    = 1.0    / 32768.0;  // dimensionless per LSB
     private static final double TEMP_SCALE    = 1.0    / 100.0;    // °C per LSB
 
     private final String portName;
@@ -100,6 +125,49 @@ public class IMUController implements AutoCloseable {
             throw new IOException("Failed to open serial port: " + portName);
         }
         logger.info("Serial port opened: {} @ {} baud", portName, baudRate);
+
+        sendRswCommand();
+    }
+
+    /**
+     * Unlocks configuration writes, then writes the RSW output-content command so the
+     * sensor switches from its default angle output to accel + gyro + quaternion.
+     *
+     * <p>The WIT command protocol has no acknowledgement or checksum, so a rejected or
+     * dropped command fails silently — the sensor just keeps its previous configuration.
+     * Sensors commonly need a short settle time right after the port opens before they
+     * accept any configuration command at all, so this waits briefly and sends the unlock
+     * + RSW pair twice to make the switch reliable in practice.
+     */
+    private void sendRswCommand() throws IOException {
+        try {
+            Thread.sleep(300);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return;
+        }
+
+        var out = serialPort.getOutputStream();
+        for (int attempt = 0; attempt < 2; attempt++) {
+            out.write(CMD_UNLOCK);
+            out.flush();
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+
+            out.write(CMD_RSW_ACCEL_GYRO_QUAT);
+            out.flush();
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        logger.info("Sent unlock + RSW command: accel + gyro + quaternion output");
     }
 
     /**
@@ -206,8 +274,8 @@ public class IMUController implements AutoCloseable {
         return switch (type) {
             case TYPE_ACCEL    -> Optional.of(parseAcceleration(words, ts));
             case TYPE_GYRO     -> Optional.of(parseGyro(words, ts));
-            case TYPE_ANGLE    -> Optional.of(parseAngle(words, ts));
             case TYPE_MAGNETIC -> Optional.of(parseMagnetic(words, ts));
+            case TYPE_QUAT     -> Optional.of(parseAngleFromQuaternion(words, ts));
             default -> {
                 logger.debug("Unknown packet type: 0x{}", String.format("%02X", type));
                 yield Optional.empty();
@@ -319,19 +387,57 @@ public class IMUController implements AutoCloseable {
                 ts);
     }
 
-    private static ImuPacket.Angle parseAngle(short[] w, Instant ts) {
-        return new ImuPacket.Angle(
-                w[0] * ANGLE_SCALE,
-                w[1] * ANGLE_SCALE,
-                w[2] * ANGLE_SCALE,
-                w[3] * TEMP_SCALE,
-                ts);
-    }
-
     private static ImuPacket.Magnetic parseMagnetic(short[] w, Instant ts) {
         return new ImuPacket.Magnetic(
                 w[0], w[1], w[2],
                 w[3] * TEMP_SCALE,
                 ts);
+    }
+
+    /**
+     * Converts a 0x59 quaternion packet ({@code w, x, y, z} in that order) into the same
+     * {@link ImuPacket.Angle} shape callers already consume, via a Z-Y-X Euler decomposition.
+     *
+     * <p>The quaternion packet carries no temperature reading, so {@code tempCelsius} is
+     * taken from the most recently received gyro/accel packet as a close approximation
+     * (falling back to {@code NaN} before either has arrived). No current caller reads
+     * {@code Angle.tempCelsius()}.
+     */
+    private ImuPacket.Angle parseAngleFromQuaternion(short[] w, Instant ts) {
+        double qw = w[0] * QUAT_SCALE;
+        double qx = w[1] * QUAT_SCALE;
+        double qy = w[2] * QUAT_SCALE;
+        double qz = w[3] * QUAT_SCALE;
+
+        double norm = Math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+        if (norm < 1e-9) {
+            qw = 1.0; qx = 0.0; qy = 0.0; qz = 0.0;
+        } else {
+            qw /= norm; qx /= norm; qy /= norm; qz /= norm;
+        }
+
+        double roll = Math.atan2(2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx * qx + qy * qy));
+
+        double sinPitch = 2.0 * (qw * qy - qz * qx);
+        sinPitch = Math.max(-1.0, Math.min(1.0, sinPitch));  // clamp against rounding error
+        double pitch = Math.asin(sinPitch);
+
+        double yaw = Math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz));
+
+        return new ImuPacket.Angle(
+                Math.toDegrees(roll),
+                Math.toDegrees(pitch),
+                Math.toDegrees(yaw),
+                latestTempCelsius(),
+                ts);
+    }
+
+    /** Most recent temperature reading from the gyro/accel packet streams, or NaN if none yet. */
+    private double latestTempCelsius() {
+        ImuPacket.Gyro gyro = gyroHistory.peekLast();
+        if (gyro != null) return gyro.tempCelsius();
+        ImuPacket.Acceleration accel = accelHistory.peekLast();
+        if (accel != null) return accel.tempCelsius();
+        return Double.NaN;
     }
 }
