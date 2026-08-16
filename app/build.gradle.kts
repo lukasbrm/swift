@@ -23,6 +23,7 @@ dependencies {
     implementation("ch.qos.logback:logback-classic:1.5.6")
     implementation("com.microsoft.onnxruntime:onnxruntime:1.27.0")
     implementation("com.fazecast:jSerialComm:2.11.0")
+    implementation("org.openpnp:opencv:4.9.0-0")
 }
 
 repositories {
