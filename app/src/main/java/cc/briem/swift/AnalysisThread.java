@@ -4,7 +4,6 @@ import java.io.ByteArrayInputStream;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.BlockingQueue;
@@ -31,24 +30,11 @@ public class AnalysisThread implements Runnable {
     private final BlockingQueue<LandmarkResult> landmarkResults;
     private final IMUController imuController;
 
-    // Moving Average Config
-    int windowSize = 5;
-    HandLandmarks[] movingAvgBuffer = new HandLandmarks[windowSize];
-    int index = 0;
-    int count = 0;
-    HandLandmarks runningSum = null;
-
-    // Low Pass Filter Config
-    HandLandmarks previousFilteredFrame = null;
-    float alpha = 0.8f;
-
     // Kalman fusion state (wrist only — see kalmanFuse)
     private UKF.WristFilter wristFilter;
     private Instant lastPredictTime;
-    private List<Point3D> referenceOffsets;   // points 0..20 minus wrist, metric world frame, from the last confident CV frame
+    private List<Point3D> referenceOffsets;   // landmarks 0..20 minus wrist, IMU/world frame, from the last confident CV frame
     private ImuPacket.Angle referenceAngle;   // IMU orientation captured alongside referenceOffsets
-    private double lastDepthScale;            // pixel->metric depth scale from the last confident CV frame, reused during occlusion
-    private List<Point3D> lastWorldPoints;
     private double lastHandednessScore;
     private double lastPresenceScore;
 
@@ -103,7 +89,6 @@ public class AnalysisThread implements Runnable {
                 // Kalman-fuse the wrist: CV is absolute truth when confident, IMU carries the
                 // estimate between frames / through occlusion. Runs every tick (predict), and
                 // additionally corrects (update) whenever a confident CV frame is present.
-                // Replaces the old lowPass/movingAverage chain (kept below, unused, for reference).
                 HandLandmarks fused = kalmanFuse(imuPackets, rawHand);
 
                 if (frame == null || landmarkResult == null) {
@@ -173,22 +158,17 @@ public class AnalysisThread implements Runnable {
 
         Instant now = Instant.now();
 
-        Point3D wristWorld = null;
-        double depthScale = 0.0;
-        if (handLandmarks != null) {
-            depthScale = computeDepthScale(handLandmarks);
-            if (depthScale > 0.0) {
-                wristWorld = computeWristWorldPosition(handLandmarks, depthScale);
-            }
-        }
-        boolean confident = wristWorld != null && handLandmarks.presenceScore >= PRESENCE_THRESHOLD;
+        List<Point3D> absolutePoints = (handLandmarks != null) ? handLandmarks.absolutePoints : null;
+        boolean confident = absolutePoints != null && !absolutePoints.isEmpty()
+                && handLandmarks.presenceScore >= PRESENCE_THRESHOLD;
+        Point3D wristWorld = confident ? flipYZ(absolutePoints.get(0)) : null;
 
         if (wristFilter == null) {
             if (!confident) {
                 return null; // nothing to bootstrap the filter from yet
             }
             wristFilter = new UKF.WristFilter(wristWorld);
-            captureReferenceShape(handLandmarks, angle, depthScale);
+            captureReferenceShape(absolutePoints, angle, handLandmarks);
             lastPredictTime = now;
             return reprojectHand(wristFilter.getPosition(), angle);
         }
@@ -201,57 +181,37 @@ public class AnalysisThread implements Runnable {
 
         if (confident) {
             wristFilter.update(wristWorld);
-            captureReferenceShape(handLandmarks, angle, depthScale);
+            captureReferenceShape(absolutePoints, angle, handLandmarks);
         }
 
         return reprojectHand(wristFilter.getPosition(), angle);
     }
 
     /**
-     * Standard pinhole back-projection of the wrist's own pixel position, using {@code depthScale}
-     * (from {@link #computeDepthScale}) as its absolute camera-to-wrist distance in metres.
+     * Caches the wrist-relative offsets + IMU orientation of a confident CV frame.
      *
-     * <p>Deliberately does NOT use {@link UKF#toWorldCoordinates} here: that helper multiplies each
-     * landmark's own {@code z} by depthScale, but MediaPipe defines landmark 0's z relative to
-     * itself (≈0, since the wrist is the depth *reference*) — so its output for the wrist is always
-     * a noise-dominated point near the origin, regardless of where the wrist actually is. Using the
-     * palm-width-derived depthScale directly as the wrist's absolute Z avoids that degeneracy.
+     * <p>Offsets come from {@code handLandmarks.absolutePoints} — the hand's real absolute position
+     * in camera space (solvePnP, see {@link HandLandmarks#getAbsoluteWorldPoints}) — converted to
+     * the IMU/world convention via {@link #flipYZ} so the rigid rotation in {@link #reprojectHand}
+     * lines up with {@link #worldRotationMatrix}.
      */
-    private static Point3D computeWristWorldPosition(HandLandmarks pixelHand, double depthScale) {
-        Point3D wristPixel = pixelHand.points.get(0);
-        double zCam = depthScale;
-        double xCam = (wristPixel.getX() - UKF.CameraIntrinsics.MBP.cx()) / UKF.CameraIntrinsics.MBP.fx() * zCam;
-        double yCam = (wristPixel.getY() - UKF.CameraIntrinsics.MBP.cy()) / UKF.CameraIntrinsics.MBP.fy() * zCam;
-        return new Point3D(xCam, -yCam, -zCam);
-    }
-
-    /**
-     * Caches the wrist-relative offsets + IMU orientation + depth scale of a confident CV frame.
-     *
-     * <p>Offsets come from {@code handLandmarks.worldPoints} — MediaPipe's own native metric hand
-     * pose (already correct and already in the X-right/Y-up/Z-toward-camera convention used
-     * throughout this class) — rather than from {@link UKF#toWorldCoordinates}, whose per-point
-     * math has the same self-relative-z issue described in {@link #computeWristWorldPosition}.
-     */
-    private void captureReferenceShape(HandLandmarks handLandmarks, ImuPacket.Angle angle, double depthScale) {
-        Point3D wristOrigin = handLandmarks.worldPoints.get(0);
-        List<Point3D> offsets = new ArrayList<>(handLandmarks.worldPoints.size());
-        for (Point3D p : handLandmarks.worldPoints) {
-            offsets.add(p.subtract(wristOrigin));
+    private void captureReferenceShape(List<Point3D> absolutePoints, ImuPacket.Angle angle, HandLandmarks handLandmarks) {
+        Point3D wristWorld = flipYZ(absolutePoints.get(0));
+        List<Point3D> offsets = new ArrayList<>(absolutePoints.size());
+        for (Point3D p : absolutePoints) {
+            offsets.add(flipYZ(p).subtract(wristWorld));
         }
         this.referenceOffsets = offsets;
         this.referenceAngle = angle;
-        this.lastDepthScale = depthScale;
-        this.lastWorldPoints = handLandmarks.worldPoints;
         this.lastHandednessScore = handLandmarks.handednessScore;
         this.lastPresenceScore = handLandmarks.presenceScore;
     }
 
     /**
      * Rigidly rotates the cached reference hand shape by however much the IMU orientation has
-     * changed since it was captured, anchors it at the fused wrist position, and projects the
-     * result back to image pixel coordinates (the frame the rest of the pipeline — DisplayApp,
-     * geometricNormal — expects {@code HandLandmarks.points} to be in).
+     * changed since it was captured, anchors it at the fused wrist position, and converts the
+     * result back to camera space (the frame {@code HandLandmarks.absolutePoints} — and therefore
+     * DisplayApp / geometricNormal — expects).
      */
     private HandLandmarks reprojectHand(Point3D fusedWristWorld, ImuPacket.Angle angle) {
         if (referenceOffsets == null) {
@@ -260,13 +220,24 @@ public class AnalysisThread implements Runnable {
 
         double[][] delta = multiply3x3(worldRotationMatrix(angle), transpose3x3(worldRotationMatrix(referenceAngle)));
 
-        List<Point3D> pixelPoints = new ArrayList<>(referenceOffsets.size());
+        List<Point3D> absolutePoints = new ArrayList<>(referenceOffsets.size());
         for (Point3D offset : referenceOffsets) {
             Point3D worldPoint = fusedWristWorld.add(applyMatrix(delta, offset));
-            pixelPoints.add(toPixelSpace(worldPoint, lastDepthScale));
+            absolutePoints.add(flipYZ(worldPoint));
         }
 
-        return new HandLandmarks(pixelPoints, lastWorldPoints, lastHandednessScore, lastPresenceScore);
+        return new HandLandmarks(absolutePoints, lastHandednessScore, lastPresenceScore);
+    }
+
+    /**
+     * Converts between {@code HandLandmarks.absolutePoints}' OpenCV camera-space convention
+     * (X = right, Y = down, Z = forward/away from camera) and the IMU/world convention used for
+     * accel fusion, {@link #worldRotationMatrix} and {@code AnalysisThread.M} (X = right, Y = up,
+     * Z = toward camera). A pure axis flip, and its own inverse, so the same formula converts
+     * either direction.
+     */
+    private static Point3D flipYZ(Point3D p) {
+        return new Point3D(p.getX(), -p.getY(), -p.getZ());
     }
 
     /**
@@ -276,94 +247,13 @@ public class AnalysisThread implements Runnable {
      * must be applied per-sigma-point (using that sigma point's own bias hypothesis) for the
      * filter to be able to observe and estimate the bias at all.
      *
-     * <p>The raw vector is negated: on this hardware, the at-rest reading maps (via {@code M})
-     * to the opposite of what was first assumed, which left gravity doubling instead of
-     * cancelling (~2g of constant phantom downward acceleration) — confirmed by on-device testing
-     * showing a fast, consistent downward drift between CV corrections.
+     * <p>Previously negated the raw vector to work around gravity doubling instead of
+     * cancelling. That was papering over {@code M} having the wrong handedness (a reflection,
+     * det -1, instead of a proper rotation) — fixed directly in {@code M} now, so this no longer
+     * needs a compensating sign flip. Re-verify gravity cancellation on-device after this change.
      */
     private static Point3D sensorAccelerationMps2(ImuPacket.Acceleration accel) {
-        return new Point3D(accel.ax(), accel.ay(), accel.az()).multiply(-GRAVITY_MPS2);
-    }
-
-    /** Mirrors UKF.toWorldCoordinates' internal depth-scale calc (landmarks 0 and 9 = its PALM_REF_A/B). */
-    private static double computeDepthScale(HandLandmarks pixelHand) {
-        Point3D refA = pixelHand.points.get(0);
-        Point3D refB = pixelHand.points.get(9);
-        double dx = refB.getX() - refA.getX();
-        double dy = refB.getY() - refA.getY();
-        double palmWidthPx = Math.sqrt(dx * dx + dy * dy);
-        if (palmWidthPx == 0.0) return 0.0;
-        return (UKF.DEFAULT_PALM_WIDTH_METRES * UKF.CameraIntrinsics.MBP.fx()) / palmWidthPx;
-    }
-
-    /** Inverse of {@link UKF#toWorldCoordinates}: projects a metric world point back to image pixels. */
-    private static Point3D toPixelSpace(Point3D worldPoint, double depthScale) {
-        double xCam = worldPoint.getX();
-        double yCam = -worldPoint.getY();
-        double zCam = -worldPoint.getZ();
-        if (depthScale <= 0.0 || zCam == 0.0) {
-            return new Point3D(UKF.CameraIntrinsics.MBP.cx(), UKF.CameraIntrinsics.MBP.cy(), 0);
-        }
-        double u = xCam / zCam * UKF.CameraIntrinsics.MBP.fx() + UKF.CameraIntrinsics.MBP.cx();
-        double v = yCam / zCam * UKF.CameraIntrinsics.MBP.fy() + UKF.CameraIntrinsics.MBP.cy();
-        double zPixel = zCam / depthScale;
-        return new Point3D(u, v, zPixel);
-    }
-
-    private HandLandmarks movingAverage(HandLandmarks newFrame) {
-        if(newFrame == null) {
-            return null;
-        }
-
-        if(runningSum == null) {
-            movingAvgBuffer[index] = newFrame;
-            runningSum = newFrame;
-            count = 1;
-            index = (index + 1) % windowSize;
-            return newFrame;
-        }
-
-        if(count == windowSize) {
-            HandLandmarks oldestFrame = movingAvgBuffer[index];
-            runningSum = runningSum.subtract(oldestFrame);
-        } else {
-            count++;
-        }
-
-        runningSum = runningSum.add(newFrame);
-        movingAvgBuffer[index] = newFrame;
-
-        index = (index + 1) % windowSize;
-
-        return runningSum.divide(count);
-    }
-
-    private void resetMovingAvgBuffer() {
-        Arrays.fill(movingAvgBuffer, null);
-        index = 0;
-        count = 0;
-        runningSum = null;
-    }
-
-    private HandLandmarks lowPassFilter(HandLandmarks newFrame) {
-        if(newFrame == null) {
-            return null;
-        }
-
-        if(previousFilteredFrame == null) {
-            previousFilteredFrame = newFrame;
-            return newFrame;
-        }
-
-        // S_t = alpha * Y_t + (1 - alpha) * S_(t-1) (S: Smoothed Frame at t, Y: incoming Frame at t, alpha: smoothing factor (exp)
-        HandLandmarks scaledNew = newFrame.multiply(alpha);
-        HandLandmarks scaledPrev = previousFilteredFrame.multiply(1.0f - alpha);
-
-        HandLandmarks smoothedFrame = scaledNew.add(scaledPrev);
-
-        previousFilteredFrame = smoothedFrame;
-
-        return smoothedFrame;
+        return new Point3D(accel.ax(), accel.ay(), accel.az()).multiply(GRAVITY_MPS2);
     }
 
     // -------------------------------------------------------------------------
@@ -373,25 +263,26 @@ public class AnalysisThread implements Runnable {
     /**
      * Fixed mounting correction matrix M.
      *
-     * <p>Encodes the physical orientation of the sensor relative to the world frame.
-     * Each column is where the corresponding sensor basis vector points in world coordinates:
+     * <p>Encodes the physical orientation of the sensor relative to the world frame, as measured
+     * in the sensor's reference pose (roll = pitch = yaw = 0). Each column is where the
+     * corresponding sensor basis vector points in world coordinates at that pose:
      * <pre>
-     *   Sensor +X → world +Z  (toward camera)
-     *   Sensor +Y → world +X  (camera's right)
-     *   Sensor +Z → world -Y  (down)
+     *   Sensor +X → world -Z  (away from camera)
+     *   Sensor +Y → world -X  (camera's left)
+     *   Sensor +Z → world +Y  (up)
      * </pre>
      *
      * <pre>
      *       sX  sY  sZ
-     *   M = [ 0   1   0 ]   world X
-     *       [ 0   0  -1 ]   world Y
-     *       [ 1   0   0 ]   world Z
+     *   M = [ 0  -1   0 ]   world X
+     *       [ 0   0   1 ]   world Y
+     *       [-1   0   0 ]   world Z
      * </pre>
      */
     public static final double[][] M = {
-            { 0,  1,  0 },
-            { 0,  0, -1 },
-            { 1,  0,  0 },
+            { 0, -1,  0 },
+            { 0,  0,  1 },
+            {-1,  0,  0 },
     };
 
     /**
@@ -507,9 +398,9 @@ public class AnalysisThread implements Runnable {
         // --- CENTROID FLIP CHECK ---
         // 1. Calculate the centroid (average position) of all landmarks
         double centroidX = 0, centroidY = 0, centroidZ = 0;
-        int totalPoints = landmarks.points.size();
+        int totalPoints = landmarks.absolutePoints.size();
 
-        for (Point3D p : landmarks.points) {
+        for (Point3D p : landmarks.absolutePoints) {
             centroidX += p.getX();
             centroidY += p.getY();
             centroidZ += p.getZ();

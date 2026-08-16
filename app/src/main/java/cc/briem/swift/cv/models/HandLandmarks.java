@@ -25,34 +25,17 @@ public class HandLandmarks {
         this.presenceScore = presenceScore;
     }
 
-    public HandLandmarks add(HandLandmarks other) {
-        List<Point3D> newPoints = new ArrayList<>(this.points.size());
-        for(int i = 0; i < this.points.size(); i++) {
-            newPoints.add(i, this.points.get(i).add(other.points.get(i)));
-        }
-
-        return new HandLandmarks(newPoints, worldPoints, handednessScore, presenceScore);
-    }
-
-    public HandLandmarks subtract(HandLandmarks other) {
-        List<Point3D> newPoints = new ArrayList<>(this.points.size());
-        for(int i = 0; i < this.points.size(); i++) {
-            newPoints.add(i, this.points.get(i).subtract(other.points.get(i)));
-        }
-
-        return new HandLandmarks(newPoints, worldPoints, handednessScore, presenceScore);
-    }
-
-    public HandLandmarks multiply(double other) {
-        List<Point3D> newPoints = new ArrayList<>(this.points.size());
-        for(int i = 0; i < this.points.size(); i++) {
-            newPoints.add(i, this.points.get(i).multiply(other));
-        }
-        return new HandLandmarks(newPoints, worldPoints, handednessScore, presenceScore);
-    }
-
-    public HandLandmarks divide(double other) {
-        return this.multiply(1.0 / other);
+    /**
+     * Builds a HandLandmarks directly from already-absolute camera-space points (e.g. the Kalman
+     * fusion output in {@code AnalysisThread}), skipping the pixel/metric-world inputs and the
+     * solvePnP in {@link #getAbsoluteWorldPoints}, since neither is available past that point.
+     */
+    public HandLandmarks(List<Point3D> absolutePoints, double handednessScore, double presenceScore) {
+        this.points = List.of();
+        this.worldPoints = List.of();
+        this.absolutePoints = absolutePoints;
+        this.handednessScore = handednessScore;
+        this.presenceScore = presenceScore;
     }
 
     public List<Point3D> getAbsoluteWorldPoints() {

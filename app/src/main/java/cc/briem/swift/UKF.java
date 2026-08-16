@@ -1,83 +1,15 @@
 package cc.briem.swift;
 
-import java.util.ArrayList;
-import java.util.List;
-
-import cc.briem.swift.cv.models.HandLandmarks;
 import javafx.geometry.Point3D;
 
 public class UKF {
-
-    /**
-     * Calibrated camera intrinsic parameters.
-     *
-     * <p>Obtain these values by running a standard camera calibration procedure
-     * (e.g. OpenCV {@code calibrateCamera} with a checkerboard pattern).
-     *
-     * <pre>
-     *   fx, fy  — focal lengths in pixels
-     *   cx, cy  — principal point (optical centre) in pixels
-     * </pre>
-     */
-    public record CameraIntrinsics(double fx, double fy, double cx, double cy) {
-
-        public static final CameraIntrinsics MBP = new CameraIntrinsics(
-                1500.0 , // fx (e.g. 921.5)
-                1500.0, // fy (e.g. 921.5)
-                960.0 , // cx (e.g. 640.0 for a 1280-wide image)
-                540.0  // cy (e.g. 360.0 for a  720-tall image)
-        );
-    }
-
-    private static final int PALM_REF_A = 0;
-    private static final int PALM_REF_B = 9;
-
-    /**
-     * Rough average adult palm width (landmark 0 → 9) in metres, used as the default metric
-     * scale reference for {@link #toWorldCoordinates}. Monocular depth is scale-ambiguous, so
-     * this is only an approximation — calibrate per-user for better absolute accuracy.
-     */
-    public static final double DEFAULT_PALM_WIDTH_METRES = 0.08;
-
-    public static HandLandmarks toWorldCoordinates(
-            HandLandmarks landmarks,
-            CameraIntrinsics intrinsics,
-            double palmWidthMetres) {
-
-        // --- Step 1: compute metric depth scale ---------------------------------
-        Point3D refA = landmarks.points.get(PALM_REF_A);
-        Point3D refB = landmarks.points.get(PALM_REF_B);
-
-        // Projected palm width: 2-D Euclidean distance in the image plane (x,y only).
-        double dx = refB.getX() - refA.getX();
-        double dy = refB.getY() - refA.getY();
-        double palmWidthPx = Math.sqrt(dx * dx + dy * dy);
-
-        if (palmWidthPx == 0.0) {
-            return null;
-        }
-
-        double depthScale = (palmWidthMetres * intrinsics.fx()) / palmWidthPx;
-
-        List<Point3D> worldPoints = new ArrayList<>(landmarks.points.size());
-
-        for (Point3D p : landmarks.points) {
-            double zCam = p.getZ() * depthScale;
-            double xCam = (p.getX() - intrinsics.cx()) / intrinsics.fx() * zCam;
-            double yCam = (p.getY() - intrinsics.cy()) / intrinsics.fy() * zCam;
-
-            worldPoints.add(new Point3D(xCam, -yCam, -zCam));
-        }
-
-        return new HandLandmarks(worldPoints, landmarks.worldPoints, landmarks.handednessScore, landmarks.presenceScore);
-    }
 
     /**
      * Sigma-point (unscented) Kalman filter tracking the wrist's 3-D position, velocity, and
      * accelerometer bias.
      *
      * <p>State vector: {@code [px, py, pz, vx, vy, vz, bx, by, bz]}, in the same metric world
-     * frame as {@link #toWorldCoordinates} and {@code AnalysisThread.M} (X = camera right,
+     * frame as {@code AnalysisThread.M} and {@code AnalysisThread.flipYZ} (X = camera right,
      * Y = up, Z = toward camera) for position/velocity; {@code bx,by,bz} is the accelerometer's
      * bias in its own sensor frame (m/s^2).
      *
