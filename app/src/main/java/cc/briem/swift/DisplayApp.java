@@ -2,10 +2,12 @@ package cc.briem.swift;
 
 import java.util.List;
 
+import cc.briem.swift.cv.CameraIntrinsics;
 import cc.briem.swift.cv.models.HandLandmarks;
 import cc.briem.swift.cv.models.LandmarkResult;
 import cc.briem.swift.imu.ImuPacket;
 import javafx.application.Application;
+import javafx.geometry.Point2D;
 import javafx.geometry.Point3D;
 import javafx.scene.Scene;
 import javafx.scene.canvas.Canvas;
@@ -115,15 +117,18 @@ public class DisplayApp extends Application {
 
         int handIndex = 0;
         for (HandLandmarks hand : result.getHands()) {
-            List<Point3D> pts = hand.points;
+            List<Point3D> pts = hand.absolutePoints;
 
             // Draw skeleton lines beneath the dots
             gc.setStroke(LINE_COLOR);
             gc.setLineWidth(LINE_WIDTH);
             for (int[] chain : CONNECTIONS) {
                 for (int i = 0; i < chain.length - 1; i++) {
-                    Point3D a = pts.get(chain[i]);
-                    Point3D b = pts.get(chain[i + 1]);
+                    Point3D a3d = pts.get(chain[i]);
+                    Point3D b3d = pts.get(chain[i + 1]);
+                    Point2D a = CameraIntrinsics.project(a3d);
+                    Point2D b = CameraIntrinsics.project(b3d);
+                    if(a == null || b == null) continue;
                     gc.strokeLine(
                         a.getX() * scale + offsetX, a.getY() * scale + offsetY,
                         b.getX() * scale + offsetX, b.getY() * scale + offsetY
@@ -133,9 +138,12 @@ public class DisplayApp extends Application {
 
             // Draw a dot at each of the 21 landmark positions
             gc.setFill(DOT_COLOR);
-            for (Point3D p : pts) {
+            for (Point3D point : pts) {
+                Point2D p = CameraIntrinsics.project(point);
+                if (p == null) continue;
                 double cx = p.getX() * scale + offsetX;
                 double cy = p.getY() * scale + offsetY;
+                gc.setFill(depthColor(point.getZ(), 0.05, 0.7));
                 gc.fillOval(cx - DOT_RADIUS, cy - DOT_RADIUS, DOT_RADIUS * 2, DOT_RADIUS * 2);
             }
 
@@ -254,5 +262,10 @@ public class DisplayApp extends Application {
         gc.setLineWidth(1);
 
         gc.fillText(text, x, y);
+    }
+
+    private static Color depthColor(double z, double zMin, double zMax) {
+        double t = Math.clamp((z - zMin) / (zMax - zMin), 0, 1);
+        return Color.hsb(200 * t, 0.85, 1.0);
     }
 }

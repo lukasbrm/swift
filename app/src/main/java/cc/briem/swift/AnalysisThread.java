@@ -104,7 +104,8 @@ public class AnalysisThread implements Runnable {
                 // estimate between frames / through occlusion. Runs every tick (predict), and
                 // additionally corrects (update) whenever a confident CV frame is present.
                 // Replaces the old lowPass/movingAverage chain (kept below, unused, for reference).
-                HandLandmarks fused = kalmanFuse(imuPackets, rawHand);
+                //HandLandmarks fused = kalmanFuse(imuPackets, rawHand);
+                HandLandmarks fused = rawHand;
 
                 if (frame == null || landmarkResult == null) {
                     continue; // no new image this tick — nothing to (re)render
@@ -170,8 +171,6 @@ public class AnalysisThread implements Runnable {
 
         ImuPacket.Acceleration accel = (ImuPacket.Acceleration) imuPackets[0];
         ImuPacket.Angle angle = (ImuPacket.Angle) imuPackets[1];
-        // imuPackets[2] (gyro) is intentionally unused — the rest of the hand is rotated
-        // statically from the absolute Angle packet each tick, not integrated from angular velocity.
 
         Instant now = Instant.now();
 
@@ -480,9 +479,9 @@ public class AnalysisThread implements Runnable {
      * @return unit normal vector in world coordinates
      */
     public static Point3D geometricNormal(HandLandmarks landmarks) {
-        Point3D point1 = landmarks.points.get(0);
-        Point3D point2 = landmarks.points.get(1);
-        Point3D point3 = landmarks.points.get(2);
+        Point3D point1 = landmarks.absolutePoints.get(0);
+        Point3D point2 = landmarks.absolutePoints.get(5);
+        Point3D point3 = landmarks.absolutePoints.get(17);
 
         // Compute two edge vectors of the triangle
         double ux = point2.getX() - point1.getX();

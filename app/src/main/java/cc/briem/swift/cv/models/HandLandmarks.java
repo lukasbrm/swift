@@ -8,15 +8,19 @@ import org.opencv.core.*;
 
 import javafx.geometry.Point3D;
 
+import static cc.briem.swift.cv.CameraIntrinsics.*;
+
 public class HandLandmarks {
     public final List<Point3D> points;          // 21 (x,y,z) in image coordinates
     public final List<Point3D> worldPoints;     // 21 (x,y,z) in metric world coordinates (MediaPipe Identity_3)
+    public List<Point3D> absolutePoints;
     public final double handednessScore; // >0.5 -> right else left
     public final double presenceScore;
 
     public HandLandmarks(List<Point3D> points, List<Point3D> worldPoints, double handednessScore, double presenceScore) {
         this.points = points;
         this.worldPoints = worldPoints;
+        this.absolutePoints = getAbsoluteWorldPoints();
         this.handednessScore = handednessScore;
         this.presenceScore = presenceScore;
     }
@@ -52,15 +56,6 @@ public class HandLandmarks {
     }
 
     public List<Point3D> getAbsoluteWorldPoints() {
-
-        // Camera Intrinsics
-        final double width = 1920;
-        final double height = 1080;
-        final double fovHorizontal = 65;
-        final double fx = (width / 2) / Math.tan(Math.toRadians(fovHorizontal) / 2);  // ≈ 1507
-        final double fy = fx;
-        final double cx = width / 2;
-        final double cy = height / 2;
 
         Mat cameraMatrix = Mat.zeros(3, 3, CvType.CV_64FC1);
         cameraMatrix.put(0, 0, fx);
@@ -119,7 +114,8 @@ public class HandLandmarks {
                     r[1][0] * x + r[1][1] * y + r[1][2] * z + ty,
                     r[2][0] * x + r[2][1] * y + r[2][2] * z + tz));
             }
-            return absolute;
+            absolutePoints = absolute;
+            return absolutePoints;
         } finally {
             cameraMatrix.release();
             distCoeffs.release();
