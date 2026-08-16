@@ -104,8 +104,7 @@ public class AnalysisThread implements Runnable {
                 // estimate between frames / through occlusion. Runs every tick (predict), and
                 // additionally corrects (update) whenever a confident CV frame is present.
                 // Replaces the old lowPass/movingAverage chain (kept below, unused, for reference).
-                //HandLandmarks fused = kalmanFuse(imuPackets, rawHand);
-                HandLandmarks fused = rawHand;
+                HandLandmarks fused = kalmanFuse(imuPackets, rawHand);
 
                 if (frame == null || landmarkResult == null) {
                     continue; // no new image this tick — nothing to (re)render
