@@ -33,8 +33,8 @@ public class AnalysisThread implements Runnable {
     // Kalman fusion state (wrist only — see kalmanFuse)
     private UKF.WristFilter wristFilter;
     private Instant lastPredictTime;
-    private List<Point3D> referenceOffsets;   // landmarks 0..20 minus wrist, IMU/world frame, from the last confident CV frame
-    private ImuPacket.Angle referenceAngle;   // IMU orientation captured alongside referenceOffsets
+    private List<Point3D> referenceOffsets;         // landmarks 0..20 minus wrist, IMU/world frame, from the last confident CV frame
+    private ImuPacket.Quaternion referenceOrientation; // IMU orientation captured alongside referenceOffsets
     private double lastHandednessScore;
     private double lastPresenceScore;
 
@@ -64,15 +64,15 @@ public class AnalysisThread implements Runnable {
                 // Get IMU data at tick time
                 Instant now = Instant.now();
                 Optional<ImuPacket.Acceleration> accelPacket = imuController.getImuAt(now, ImuPacket.Acceleration.class);
-                Optional<ImuPacket.Angle> anglePacketOpt = imuController.getImuAt(now, ImuPacket.Angle.class);
+                Optional<ImuPacket.Quaternion> quaternionPacketOpt = imuController.getImuAt(now, ImuPacket.Quaternion.class);
                 Optional<ImuPacket.Gyro> gyroPacket = imuController.getImuAt(now, ImuPacket.Gyro.class);
-                if (accelPacket.isEmpty() || anglePacketOpt.isEmpty() || gyroPacket.isEmpty()) {
+                if (accelPacket.isEmpty() || quaternionPacketOpt.isEmpty() || gyroPacket.isEmpty()) {
                     continue; // IMU hasn't produced its first packet(s) of every type yet
                 }
-                ImuPacket.Angle anglePacket = anglePacketOpt.get();
+                ImuPacket.Quaternion quaternionPacket = quaternionPacketOpt.get();
                 ImuPacket[] imuPackets = new ImuPacket[3];
                 imuPackets[0] = accelPacket.get();
-                imuPackets[1] = anglePacket;
+                imuPackets[1] = quaternionPacket;
                 imuPackets[2] = gyroPacket.get();
 
                 // Predict landmarks from frame, if one arrived this tick
@@ -108,7 +108,7 @@ public class AnalysisThread implements Runnable {
 
                 // Calculate palm normals
                 Point3D[] imuNormal = new Point3D[2];
-                imuNormal[0] = imuNormal(anglePacket);
+                imuNormal[0] = imuNormal(quaternionPacket);
                 imuNormal[1] = imuNormal[0]; // Only 1 sensor for now
                 Point3D[] geometricNormal = new Point3D[2];
                 geometricNormal[0] = new Point3D(0, 0, 0); // ensures not null
@@ -154,7 +154,7 @@ public class AnalysisThread implements Runnable {
          */
 
         ImuPacket.Acceleration accel = (ImuPacket.Acceleration) imuPackets[0];
-        ImuPacket.Angle angle = (ImuPacket.Angle) imuPackets[1];
+        ImuPacket.Quaternion orientation = (ImuPacket.Quaternion) imuPackets[1];
 
         Instant now = Instant.now();
 
@@ -168,23 +168,23 @@ public class AnalysisThread implements Runnable {
                 return null; // nothing to bootstrap the filter from yet
             }
             wristFilter = new UKF.WristFilter(wristWorld);
-            captureReferenceShape(absolutePoints, angle, handLandmarks);
+            captureReferenceShape(absolutePoints, orientation, handLandmarks);
             lastPredictTime = now;
-            return reprojectHand(wristFilter.getPosition(), angle);
+            return reprojectHand(wristFilter.getPosition(), orientation);
         }
 
         double dt = (lastPredictTime == null) ? 0.0 : Duration.between(lastPredictTime, now).toNanos() / 1_000_000_000.0;
         lastPredictTime = now;
         if (dt > 0.0) {
-            wristFilter.predict(dt, sensorAccelerationMps2(accel), worldRotationMatrix(angle));
+            wristFilter.predict(dt, sensorAccelerationMps2(accel), worldRotationMatrix(orientation));
         }
 
         if (confident) {
             wristFilter.update(wristWorld);
-            captureReferenceShape(absolutePoints, angle, handLandmarks);
+            captureReferenceShape(absolutePoints, orientation, handLandmarks);
         }
 
-        return reprojectHand(wristFilter.getPosition(), angle);
+        return reprojectHand(wristFilter.getPosition(), orientation);
     }
 
     /**
@@ -195,14 +195,14 @@ public class AnalysisThread implements Runnable {
      * the IMU/world convention via {@link #flipYZ} so the rigid rotation in {@link #reprojectHand}
      * lines up with {@link #worldRotationMatrix}.
      */
-    private void captureReferenceShape(List<Point3D> absolutePoints, ImuPacket.Angle angle, HandLandmarks handLandmarks) {
+    private void captureReferenceShape(List<Point3D> absolutePoints, ImuPacket.Quaternion orientation, HandLandmarks handLandmarks) {
         Point3D wristWorld = flipYZ(absolutePoints.get(0));
         List<Point3D> offsets = new ArrayList<>(absolutePoints.size());
         for (Point3D p : absolutePoints) {
             offsets.add(flipYZ(p).subtract(wristWorld));
         }
         this.referenceOffsets = offsets;
-        this.referenceAngle = angle;
+        this.referenceOrientation = orientation;
         this.lastHandednessScore = handLandmarks.handednessScore;
         this.lastPresenceScore = handLandmarks.presenceScore;
     }
@@ -213,12 +213,12 @@ public class AnalysisThread implements Runnable {
      * result back to camera space (the frame {@code HandLandmarks.absolutePoints} — and therefore
      * DisplayApp / geometricNormal — expects).
      */
-    private HandLandmarks reprojectHand(Point3D fusedWristWorld, ImuPacket.Angle angle) {
+    private HandLandmarks reprojectHand(Point3D fusedWristWorld, ImuPacket.Quaternion orientation) {
         if (referenceOffsets == null) {
             return null;
         }
 
-        double[][] delta = multiply3x3(worldRotationMatrix(angle), transpose3x3(worldRotationMatrix(referenceAngle)));
+        double[][] delta = multiply3x3(worldRotationMatrix(orientation), transpose3x3(worldRotationMatrix(referenceOrientation)));
 
         List<Point3D> absolutePoints = new ArrayList<>(referenceOffsets.size());
         for (Point3D offset : referenceOffsets) {
@@ -288,47 +288,50 @@ public class AnalysisThread implements Runnable {
     /**
      * Computes the IMU sensor's normal vector in world coordinates.
      *
-     * <p>Applies {@code n_world = M * R(roll,pitch,yaw) * (0,0,-1)}, where:
+     * <p>Applies {@code n_world = M * R(quaternion) * (0,0,-1)}, where:
      * <ul>
      *   <li>{@code (0,0,-1)} is the sensor's outward normal in its own frame (-Z face)</li>
-     *   <li>{@code R} is the ZYX Euler rotation reported by the WIT sensor</li>
+     *   <li>{@code R} is the rotation the WIT sensor's quaternion represents</li>
      *   <li>{@code M} is the fixed mounting correction matrix above</li>
      * </ul>
      *
-     * @param angle IMU angle packet (roll, pitch, yaw in degrees)
+     * @param orientation IMU quaternion packet
      * @return unit normal vector in world coordinates
      */
-    public static Point3D imuNormal(ImuPacket.Angle angle) {
-        return rotateSensorToWorld(new Point3D(0, 0, -1), angle);
+    public static Point3D imuNormal(ImuPacket.Quaternion orientation) {
+        return rotateSensorToWorld(new Point3D(0, 0, -1), orientation);
     }
 
     /**
-     * Full sensor-to-world rotation matrix {@code M * R(roll,pitch,yaw)}, generalizing the
+     * Full sensor-to-world rotation matrix {@code M * R(quaternion)}, generalizing the
      * {@code n_world = M * R * (0,0,-1)} formula above to arbitrary sensor-frame vectors
      * (used both for {@link #imuNormal} and to rotate IMU acceleration / the rest of the
      * hand's landmarks into world coordinates in {@code kalmanFuse}).
+     *
+     * <p>Builds {@code R} directly from the quaternion (standard conversion formula, no
+     * trigonometry) instead of round-tripping through Euler roll/pitch/yaw. That round trip
+     * has a gimbal-lock singularity at pitch = ±90° — a pose a wrist-mounted sensor reaches
+     * easily (forearm held vertical) — where roll and yaw become numerically indistinguishable
+     * and the reconstructed matrix degrades. The quaternion has no such singularity, and skips
+     * the conversion's two lossy trigonometric round trips per call.
      */
-    private static double[][] worldRotationMatrix(ImuPacket.Angle angle) {
-        double r = Math.toRadians(angle.roll());
-        double p = Math.toRadians(angle.pitch());
-        double y = Math.toRadians(angle.yaw());
+    private static double[][] worldRotationMatrix(ImuPacket.Quaternion orientation) {
+        double qw = orientation.qw();
+        double qx = orientation.qx();
+        double qy = orientation.qy();
+        double qz = orientation.qz();
 
-        double sr = Math.sin(r), cr = Math.cos(r);
-        double sp = Math.sin(p), cp = Math.cos(p);
-        double sy = Math.sin(y), cy = Math.cos(y);
-
-        // R = Rz(yaw) * Ry(pitch) * Rx(roll)
         double[][] rot = {
-                { cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr },
-                { sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr },
-                { -sp,     cp * sr,                cp * cr                }
+                { 1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw),     2 * (qx * qz + qy * qw) },
+                { 2 * (qx * qy + qz * qw),     1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw) },
+                { 2 * (qx * qz - qy * qw),     2 * (qy * qz + qx * qw),     1 - 2 * (qx * qx + qy * qy) }
         };
 
         return multiply3x3(M, rot);
     }
 
-    private static Point3D rotateSensorToWorld(Point3D sensorVec, ImuPacket.Angle angle) {
-        return applyMatrix(worldRotationMatrix(angle), sensorVec);
+    private static Point3D rotateSensorToWorld(Point3D sensorVec, ImuPacket.Quaternion orientation) {
+        return applyMatrix(worldRotationMatrix(orientation), sensorVec);
     }
 
     private static Point3D applyMatrix(double[][] mat, Point3D v) {

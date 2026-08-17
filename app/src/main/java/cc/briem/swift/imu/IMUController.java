@@ -28,11 +28,10 @@ import com.fazecast.jSerialComm.SerialPort;
  *   [10] checksum    – lower 8 bits of sum of bytes 0–9
  * </pre>
  *
- * <p>{@link ImuPacket.Angle} (roll/pitch/yaw) is no longer read from the sensor's native
- * 0x53 angle packet. Instead {@link #open()} switches the sensor's output register to emit
- * quaternion (0x59) packets, and every quaternion received is converted to roll/pitch/yaw
- * ({@link #parseAngleFromQuaternion}) so the rest of this class — history, {@link #getImuAt}
- * — is unaffected by the change.
+ * <p>Orientation is read as {@link ImuPacket.Quaternion} rather than the sensor's native 0x53
+ * Euler-angle packet: {@link #open()} switches the sensor's output register to emit quaternion
+ * (0x59) packets instead, which {@link #parseQuaternion} normalizes and passes through as-is —
+ * no Euler conversion happens here (see {@code AnalysisThread.worldRotationMatrix} for why).
  *
  * <p>Usage:
  * <pre>{@code
@@ -86,10 +85,10 @@ public class IMUController implements AutoCloseable {
     private static final int HISTORY_SIZE = 256;
 
     // Per-type ring buffers — bounded, thread-safe
-    private final Deque<ImuPacket.Acceleration> accelHistory = new ConcurrentLinkedDeque<>();
-    private final Deque<ImuPacket.Gyro>         gyroHistory  = new ConcurrentLinkedDeque<>();
-    private final Deque<ImuPacket.Angle>        angleHistory = new ConcurrentLinkedDeque<>();
-    private final Deque<ImuPacket.Magnetic>     magHistory   = new ConcurrentLinkedDeque<>();
+    private final Deque<ImuPacket.Acceleration> accelHistory      = new ConcurrentLinkedDeque<>();
+    private final Deque<ImuPacket.Gyro>         gyroHistory       = new ConcurrentLinkedDeque<>();
+    private final Deque<ImuPacket.Quaternion>   quaternionHistory = new ConcurrentLinkedDeque<>();
+    private final Deque<ImuPacket.Magnetic>     magHistory        = new ConcurrentLinkedDeque<>();
 
     private SerialPort serialPort;
 
@@ -275,7 +274,7 @@ public class IMUController implements AutoCloseable {
             case TYPE_ACCEL    -> Optional.of(parseAcceleration(words, ts));
             case TYPE_GYRO     -> Optional.of(parseGyro(words, ts));
             case TYPE_MAGNETIC -> Optional.of(parseMagnetic(words, ts));
-            case TYPE_QUAT     -> Optional.of(parseAngleFromQuaternion(words, ts));
+            case TYPE_QUAT     -> Optional.of(parseQuaternion(words, ts));
             default -> {
                 logger.debug("Unknown packet type: 0x{}", String.format("%02X", type));
                 yield Optional.empty();
@@ -340,7 +339,7 @@ public class IMUController implements AutoCloseable {
         switch (packet) {
             case ImuPacket.Acceleration a -> append(accelHistory, a);
             case ImuPacket.Gyro         g -> append(gyroHistory,  g);
-            case ImuPacket.Angle      ang -> append(angleHistory, ang);
+            case ImuPacket.Quaternion   q -> append(quaternionHistory, q);
             case ImuPacket.Magnetic     m -> append(magHistory,   m);
         }
     }
@@ -356,7 +355,7 @@ public class IMUController implements AutoCloseable {
     private <T extends ImuPacket> Deque<T> historyFor(Class<T> type) {
         if (type == ImuPacket.Acceleration.class) return (Deque<T>) accelHistory;
         if (type == ImuPacket.Gyro.class)         return (Deque<T>) gyroHistory;
-        if (type == ImuPacket.Angle.class)        return (Deque<T>) angleHistory;
+        if (type == ImuPacket.Quaternion.class)   return (Deque<T>) quaternionHistory;
         if (type == ImuPacket.Magnetic.class)     return (Deque<T>) magHistory;
         return null;
     }
@@ -395,15 +394,17 @@ public class IMUController implements AutoCloseable {
     }
 
     /**
-     * Converts a 0x59 quaternion packet ({@code w, x, y, z} in that order) into the same
-     * {@link ImuPacket.Angle} shape callers already consume, via a Z-Y-X Euler decomposition.
+     * Parses a 0x59 quaternion packet ({@code w, x, y, z} in that order), normalized to unit
+     * length. No Euler conversion here — callers that need a rotation matrix build it directly
+     * from the quaternion (see {@code AnalysisThread.worldRotationMatrix}), and callers that need
+     * human-readable roll/pitch/yaw (e.g. {@code DebugThread}) convert only for display.
      *
      * <p>The quaternion packet carries no temperature reading, so {@code tempCelsius} is
      * taken from the most recently received gyro/accel packet as a close approximation
      * (falling back to {@code NaN} before either has arrived). No current caller reads
-     * {@code Angle.tempCelsius()}.
+     * {@code Quaternion.tempCelsius()}.
      */
-    private ImuPacket.Angle parseAngleFromQuaternion(short[] w, Instant ts) {
+    private ImuPacket.Quaternion parseQuaternion(short[] w, Instant ts) {
         double qw = w[0] * QUAT_SCALE;
         double qx = w[1] * QUAT_SCALE;
         double qy = w[2] * QUAT_SCALE;
@@ -416,20 +417,7 @@ public class IMUController implements AutoCloseable {
             qw /= norm; qx /= norm; qy /= norm; qz /= norm;
         }
 
-        double roll = Math.atan2(2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx * qx + qy * qy));
-
-        double sinPitch = 2.0 * (qw * qy - qz * qx);
-        sinPitch = Math.max(-1.0, Math.min(1.0, sinPitch));  // clamp against rounding error
-        double pitch = Math.asin(sinPitch);
-
-        double yaw = Math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz));
-
-        return new ImuPacket.Angle(
-                Math.toDegrees(roll),
-                Math.toDegrees(pitch),
-                Math.toDegrees(yaw),
-                latestTempCelsius(),
-                ts);
+        return new ImuPacket.Quaternion(qw, qx, qy, qz, latestTempCelsius(), ts);
     }
 
     /** Most recent temperature reading from the gyro/accel packet streams, or NaN if none yet. */

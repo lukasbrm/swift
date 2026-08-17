@@ -9,7 +9,7 @@ import java.time.Instant;
 public sealed interface ImuPacket permits
         ImuPacket.Acceleration,
         ImuPacket.Gyro,
-        ImuPacket.Angle,
+        ImuPacket.Quaternion,
         ImuPacket.Magnetic {
 
     /** Timestamp when the packet was received. */
@@ -53,18 +53,25 @@ public sealed interface ImuPacket permits
     ) implements ImuPacket {}
 
     /**
-     * Packet type 0x53 — Euler angles.
+     * Packet type 0x59 — orientation, as a unit quaternion (Hamilton convention, body-to-world).
      *
-     * @param roll        roll angle in degrees
-     * @param pitch       pitch angle in degrees
-     * @param yaw         yaw angle in degrees
+     * <p>Used directly for rotation math (see {@code AnalysisThread.worldRotationMatrix}) instead
+     * of converting to Euler roll/pitch/yaw: a quaternion has no gimbal-lock singularity, which
+     * Euler angles do at pitch = ±90° — a pose a wrist-mounted sensor reaches easily (forearm
+     * held vertical).
+     *
+     * @param qw          scalar component
+     * @param qx          X component
+     * @param qy          Y component
+     * @param qz          Z component
      * @param tempCelsius temperature in °C
      * @param timestamp   receive timestamp
      */
-    record Angle(
-            double roll,
-            double pitch,
-            double yaw,
+    record Quaternion(
+            double qw,
+            double qx,
+            double qy,
+            double qz,
             double tempCelsius,
             Instant timestamp
     ) implements ImuPacket {}
