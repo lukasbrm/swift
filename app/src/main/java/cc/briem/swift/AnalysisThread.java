@@ -115,6 +115,11 @@ public class AnalysisThread implements Runnable {
                 geometricNormal[1] = new Point3D(0, 0, 0); // ensures not null
                 if(!hands.isEmpty()) {
                     geometricNormal[0] = geometricNormal(hands.getFirst());
+                    if (isConfidentDetection(rawHand)) {
+                        // Refine the IMU->world yaw offset against this tick's CV ground truth —
+                        // see updateYawOffset.
+                        updateYawOffset(geometricNormal[0], rawImuNormal(quaternionPacket));
+                    }
                     if(hands.size() > 1) {
                         geometricNormal[1] = geometricNormal(hands.getLast());
                     }
@@ -158,9 +163,8 @@ public class AnalysisThread implements Runnable {
 
         Instant now = Instant.now();
 
-        List<Point3D> absolutePoints = (handLandmarks != null) ? handLandmarks.absolutePoints : null;
-        boolean confident = absolutePoints != null && !absolutePoints.isEmpty()
-                && handLandmarks.presenceScore >= PRESENCE_THRESHOLD;
+        boolean confident = isConfidentDetection(handLandmarks);
+        List<Point3D> absolutePoints = confident ? handLandmarks.absolutePoints : null;
         Point3D wristWorld = confident ? flipYZ(absolutePoints.get(0)) : null;
 
         if (wristFilter == null) {
@@ -229,6 +233,12 @@ public class AnalysisThread implements Runnable {
         return new HandLandmarks(absolutePoints, lastHandednessScore, lastPresenceScore);
     }
 
+    /** Shared confidence gate for a raw CV detection — "trust this frame as absolute truth". */
+    private static boolean isConfidentDetection(HandLandmarks h) {
+        return h != null && h.absolutePoints != null && !h.absolutePoints.isEmpty()
+                && h.presenceScore >= PRESENCE_THRESHOLD;
+    }
+
     /**
      * Converts between {@code HandLandmarks.absolutePoints}' OpenCV camera-space convention
      * (X = right, Y = down, Z = forward/away from camera) and the IMU/world convention used for
@@ -278,6 +288,17 @@ public class AnalysisThread implements Runnable {
      *       [ 0   0   1 ]   world Y
      *       [-1   0   0 ]   world Z
      * </pre>
+     *
+     * <p><b>Only roll/pitch (the vertical part) of this is trustworthy as a fixed constant.</b>
+     * Roll/pitch are gravity-referenced, so they're the same physical relationship regardless of
+     * where or when the sensor is used. Yaw is not: this WIT sensor's quaternion reports an
+     * <i>absolute</i>, magnetometer-referenced heading (confirmed on-device — power-cycling in a
+     * different orientation gives a different, not reset, yaw), so "yaw = 0" is a fixed direction
+     * in the real world (e.g. magnetic north) that has no fixed relationship to "facing the
+     * camera" — that relationship depends on which way the camera/desk happens to be pointing
+     * that session. Baking a specific one in here would silently break in any other room/desk
+     * orientation. So {@code M}'s yaw is left as whatever the reference-pose derivation above
+     * produced, and corrected at runtime instead — see {@link #yawOffsetCos}.
      */
     public static final double[][] M = {
             { 0, -1,  0 },
@@ -285,28 +306,96 @@ public class AnalysisThread implements Runnable {
             {-1,  0,  0 },
     };
 
+    // Runtime yaw calibration: corrects M's heading component by comparing the IMU-derived palm
+    // normal (uncorrected) against the CV-derived one (ground truth, see geometricNormal)
+    // whenever a confident CV frame is available — see updateYawOffset. Tracked as (cos, sin)
+    // rather than a raw angle so blending across samples handles the ±180° wraparound correctly.
+    private double yawOffsetCos = 1.0;
+    private double yawOffsetSin = 0.0;
+    private boolean yawOffsetCalibrated = false;
+
+    private static final double YAW_CALIBRATION_ALPHA = 0.05; // low-pass factor, damps single-frame hand-pose noise
+    private static final double MIN_HORIZONTAL_NORM = 0.15;   // below this a normal is too close to vertical to constrain yaw
+
     /**
      * Computes the IMU sensor's normal vector in world coordinates.
      *
-     * <p>Applies {@code n_world = M * R(quaternion) * (0,0,-1)}, where:
+     * <p>Applies {@code n_world = yawOffset * M * R(quaternion) * (0,0,-1)}, where:
      * <ul>
      *   <li>{@code (0,0,-1)} is the sensor's outward normal in its own frame (-Z face)</li>
      *   <li>{@code R} is the rotation the WIT sensor's quaternion represents</li>
      *   <li>{@code M} is the fixed mounting correction matrix above</li>
+     *   <li>{@code yawOffset} is the runtime-calibrated heading correction, see {@link #yawOffsetCos}</li>
      * </ul>
      *
      * @param orientation IMU quaternion packet
      * @return unit normal vector in world coordinates
      */
-    public static Point3D imuNormal(ImuPacket.Quaternion orientation) {
+    private Point3D imuNormal(ImuPacket.Quaternion orientation) {
         return rotateSensorToWorld(new Point3D(0, 0, -1), orientation);
     }
 
     /**
-     * Full sensor-to-world rotation matrix {@code M * R(quaternion)}, generalizing the
-     * {@code n_world = M * R * (0,0,-1)} formula above to arbitrary sensor-frame vectors
+     * {@link #imuNormal}, but using {@code M} alone — without the runtime yaw correction. This is
+     * the raw signal {@link #updateYawOffset} calibrates against; computing the calibrated
+     * {@link #imuNormal} from CV ground truth would be circular.
+     */
+    private static Point3D rawImuNormal(ImuPacket.Quaternion orientation) {
+        return applyMatrix(rotationBeforeYawCorrection(orientation), new Point3D(0, 0, -1));
+    }
+
+    /**
+     * Refines {@link #yawOffsetCos}/{@link #yawOffsetSin} by comparing this tick's CV-truth palm
+     * normal against {@link #rawImuNormal}. Only the horizontal (world X/Z) component of each
+     * normal constrains heading, so this is skipped when either is too close to vertical (hand
+     * facing straight up/down) for that angle to be numerically stable. Snaps directly to the
+     * first usable sample (nothing to blend with yet), then low-pass filters further samples.
+     */
+    private void updateYawOffset(Point3D geometricNormal, Point3D rawImuNormal) {
+        double geomHoriz = Math.hypot(geometricNormal.getX(), geometricNormal.getZ());
+        double imuHoriz = Math.hypot(rawImuNormal.getX(), rawImuNormal.getZ());
+        if (geomHoriz < MIN_HORIZONTAL_NORM || imuHoriz < MIN_HORIZONTAL_NORM) {
+            return;
+        }
+
+        double geomHeading = Math.atan2(geometricNormal.getX(), geometricNormal.getZ());
+        double imuHeading = Math.atan2(rawImuNormal.getX(), rawImuNormal.getZ());
+        double sampleOffset = geomHeading - imuHeading;
+        double sampleCos = Math.cos(sampleOffset);
+        double sampleSin = Math.sin(sampleOffset);
+
+        if (!yawOffsetCalibrated) {
+            yawOffsetCos = sampleCos;
+            yawOffsetSin = sampleSin;
+            yawOffsetCalibrated = true;
+        } else {
+            yawOffsetCos += YAW_CALIBRATION_ALPHA * (sampleCos - yawOffsetCos);
+            yawOffsetSin += YAW_CALIBRATION_ALPHA * (sampleSin - yawOffsetSin);
+        }
+    }
+
+    /** Rotation about world Y (up) by the calibrated yaw offset — see {@link #yawOffsetCos}. */
+    private double[][] yawOffsetMatrix() {
+        return new double[][]{
+                { yawOffsetCos, 0, yawOffsetSin },
+                { 0,            1, 0            },
+                {-yawOffsetSin, 0, yawOffsetCos },
+        };
+    }
+
+    /**
+     * Full sensor-to-world rotation matrix {@code yawOffset * M * R(quaternion)}, generalizing
+     * the {@code n_world = M * R * (0,0,-1)} formula above to arbitrary sensor-frame vectors
      * (used both for {@link #imuNormal} and to rotate IMU acceleration / the rest of the
      * hand's landmarks into world coordinates in {@code kalmanFuse}).
+     */
+    private double[][] worldRotationMatrix(ImuPacket.Quaternion orientation) {
+        return multiply3x3(yawOffsetMatrix(), rotationBeforeYawCorrection(orientation));
+    }
+
+    /**
+     * {@code M * R(quaternion)}, before the runtime yaw correction — see {@link #rawImuNormal}
+     * and {@link #worldRotationMatrix}.
      *
      * <p>Builds {@code R} directly from the quaternion (standard conversion formula, no
      * trigonometry) instead of round-tripping through Euler roll/pitch/yaw. That round trip
@@ -315,7 +404,7 @@ public class AnalysisThread implements Runnable {
      * and the reconstructed matrix degrades. The quaternion has no such singularity, and skips
      * the conversion's two lossy trigonometric round trips per call.
      */
-    private static double[][] worldRotationMatrix(ImuPacket.Quaternion orientation) {
+    private static double[][] rotationBeforeYawCorrection(ImuPacket.Quaternion orientation) {
         double qw = orientation.qw();
         double qx = orientation.qx();
         double qy = orientation.qy();
@@ -330,7 +419,7 @@ public class AnalysisThread implements Runnable {
         return multiply3x3(M, rot);
     }
 
-    private static Point3D rotateSensorToWorld(Point3D sensorVec, ImuPacket.Quaternion orientation) {
+    private Point3D rotateSensorToWorld(Point3D sensorVec, ImuPacket.Quaternion orientation) {
         return applyMatrix(worldRotationMatrix(orientation), sensorVec);
     }
 

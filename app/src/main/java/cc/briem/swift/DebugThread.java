@@ -20,7 +20,7 @@ public class DebugThread implements Runnable {
 
     private static final Logger logger = LoggerFactory.getLogger(DebugThread.class);
 
-    private static final String DEFAULT_PORT = "/dev/tty.usbserial-210";
+    private static final String DEFAULT_PORT = "/dev/tty.usbserial-110";
     private static final int    DEFAULT_BAUD = 115200;
 
     private volatile Label accelLabel;

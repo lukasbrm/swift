@@ -26,11 +26,13 @@ public class UKF {
      * <p>{@link #predict} advances the state using the raw sensor-frame specific force and the
      * current sensor-to-world rotation; bias subtraction and rotation happen per-sigma-point
      * (not precomputed) specifically so the filter can observe the bias's effect on predicted
-     * position. It also applies an exponential velocity decay (a "singer"/drag-style term) so
-     * that even a not-yet-fully-learned bias can't drive runaway velocity growth over an extended
-     * gap between corrections. {@link #update} corrects the whole state against an absolute CV
-     * wrist measurement. Both steps use the standard Van der Merwe scaled sigma-point set
-     * (2N+1 = 19 points for N=9).
+     * position. It also applies an exponential velocity decay per axis (a "singer"/drag-style
+     * term, see {@code velocityDampingTauSecondsX/Y/Z}) so that even a not-yet-fully-learned bias
+     * can't drive runaway velocity growth over an extended gap between corrections — tuned
+     * tighter for Z than X/Y, since world Z (depth) is both the noisiest CV signal and, in
+     * practice, the axis whose motion most often causes the occlusion in the first place.
+     * {@link #update} corrects the whole state against an absolute CV wrist measurement. Both
+     * steps use the standard Van der Merwe scaled sigma-point set (2N+1 = 19 points for N=9).
      */
     public static final class WristFilter {
 
@@ -51,14 +53,24 @@ public class UKF {
         // biasRandomWalkStd (m/s^2 per sqrt(second)): how fast the accelerometer bias is allowed to
         //   drift — small, since real sensor bias changes slowly (temperature etc.), but non-zero so
         //   the filter can keep refining/adapting its estimate over time.
-        // velocityDampingTauSeconds: exponential decay time constant applied to velocity every
+        // velocityDampingTauSecondsXyz: exponential decay time constant applied to velocity every
         //   predict() call, absent that being corrected by measurement updates. Bounds how far
         //   uncorrected velocity (and therefore position) can run away during a long occlusion,
         //   without zeroing out real short-term motion between frequent confident corrections.
+        //   Per-axis (not one shared value): world Z (depth, toward/away from camera) is both the
+        //   noisiest/most bias-prone CV measurement (monocular depth via solvePnP against an
+        //   assumed hand size, unlike the well-constrained image-plane X/Y) and, in practice, the
+        //   axis whose motion most often *causes* occlusion in the first place (the hand leaving
+        //   camera range by moving toward/away from it) — so an occlusion is disproportionately
+        //   likely to start with a large, poorly-known Z velocity that then dead-reckons unchecked.
+        //   Damping Z harder caps that runaway drift; X/Y keep the gentler default since lateral
+        //   occlusion-time drift wasn't reported as a problem.
         private double accelNoiseStd = 1.5;
         private double measurementNoiseStd = 0.005;
         private double biasRandomWalkStd = 0.02;
-        private double velocityDampingTauSeconds = 1.5;
+        private double velocityDampingTauSecondsX = 1.5;
+        private double velocityDampingTauSecondsY = 1.5;
+        private double velocityDampingTauSecondsZ = 0.5;
 
         private double[] x = new double[N];
         private double[][] P;
@@ -78,7 +90,11 @@ public class UKF {
 
         public void setBiasRandomWalkStd(double std) { this.biasRandomWalkStd = std; }
 
-        public void setVelocityDampingTauSeconds(double tauSeconds) { this.velocityDampingTauSeconds = tauSeconds; }
+        public void setVelocityDampingTauSeconds(double xSeconds, double ySeconds, double zSeconds) {
+            this.velocityDampingTauSecondsX = xSeconds;
+            this.velocityDampingTauSecondsY = ySeconds;
+            this.velocityDampingTauSecondsZ = zSeconds;
+        }
 
         public Point3D getPosition() { return new Point3D(x[0], x[1], x[2]); }
 
@@ -159,15 +175,17 @@ public class UKF {
             double worldAz = worldRotation[2][0] * correctedX + worldRotation[2][1] * correctedY + worldRotation[2][2] * correctedZ;
             worldAy -= GRAVITY_MPS2; // gravity points down (world -Y)
 
-            double velocityDecay = Math.exp(-dt / velocityDampingTauSeconds);
+            double decayX = Math.exp(-dt / velocityDampingTauSecondsX);
+            double decayY = Math.exp(-dt / velocityDampingTauSecondsY);
+            double decayZ = Math.exp(-dt / velocityDampingTauSecondsZ);
 
             double[] out = new double[N];
             out[0] = s[0] + s[3] * dt;
             out[1] = s[1] + s[4] * dt;
             out[2] = s[2] + s[5] * dt;
-            out[3] = (s[3] + worldAx * dt) * velocityDecay;
-            out[4] = (s[4] + worldAy * dt) * velocityDecay;
-            out[5] = (s[5] + worldAz * dt) * velocityDecay;
+            out[3] = (s[3] + worldAx * dt) * decayX;
+            out[4] = (s[4] + worldAy * dt) * decayY;
+            out[5] = (s[5] + worldAz * dt) * decayZ;
             out[6] = s[6];
             out[7] = s[7];
             out[8] = s[8];
