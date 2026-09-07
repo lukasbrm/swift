@@ -31,6 +31,13 @@ public class UKF {
      * can't drive runaway velocity growth over an extended gap between corrections — tuned
      * tighter for Z than X/Y, since world Z (depth) is both the noisiest CV signal and, in
      * practice, the axis whose motion most often causes the occlusion in the first place.
+     * The decay's time constant is itself adaptive (see {@code velocityDampingTauSecondsStillX/Y/Z}
+     * and {@code stillnessAccelThresholdMps2}): it tightens toward a fast "still" tau whenever the
+     * bias-and-gravity-corrected world acceleration is near zero (nothing left in the signal to
+     * explain any remaining velocity), and relaxes toward the gentler "moving" tau above while real
+     * acceleration is present — so a residual velocity error left over right as the hand actually
+     * stops gets killed quickly (bounding how far position can glide past the true stop before
+     * settling) without fighting genuine sustained motion the rest of the time.
      * {@link #update} corrects the whole state against an absolute CV wrist measurement. Both
      * steps use the standard Van der Merwe scaled sigma-point set (2N+1 = 19 points for N=9).
      */
@@ -65,12 +72,25 @@ public class UKF {
         //   likely to start with a large, poorly-known Z velocity that then dead-reckons unchecked.
         //   Damping Z harder caps that runaway drift; X/Y keep the gentler default since lateral
         //   occlusion-time drift wasn't reported as a problem.
-        private double accelNoiseStd = 1.5;
-        private double measurementNoiseStd = 0.005;
-        private double biasRandomWalkStd = 0.02;
-        private double velocityDampingTauSecondsX = 1.5;
-        private double velocityDampingTauSecondsY = 1.5;
+        // velocityDampingTauSecondsStillXyz / stillnessAccelThresholdMps2: the tau values above are
+        //   the *ceiling*, used while the sensor is reporting real net force. Per predict() call, the
+        //   effective tau is blended down toward these tighter "still" values as the bias-and-gravity-
+        //   corrected world acceleration magnitude drops toward zero — i.e. as the signal itself stops
+        //   giving any reason for velocity to be nonzero. This matters because a flat tau lets any
+        //   residual velocity error still present right when real motion stops bleed off slowly,
+        //   integrating into a fixed extra "glide" past the true stop (distance ≈ residual velocity
+        //   × tau); tightening tau specifically once the signal goes quiet kills that residual fast
+        //   without having to shorten the ceiling tau and fight genuine sustained motion everywhere else.
+        private double accelNoiseStd = 3;
+        private double measurementNoiseStd = 0.02;
+        private double biasRandomWalkStd = 0.01;
+        private double velocityDampingTauSecondsX = 0.5;
+        private double velocityDampingTauSecondsY = 0.5;
         private double velocityDampingTauSecondsZ = 0.5;
+        private double velocityDampingTauSecondsStillX = 0.15;
+        private double velocityDampingTauSecondsStillY = 0.15;
+        private double velocityDampingTauSecondsStillZ = 0.1;
+        private double stillnessAccelThresholdMps2 = 1.0;
 
         private double[] x = new double[N];
         private double[][] P;
@@ -94,6 +114,19 @@ public class UKF {
             this.velocityDampingTauSecondsX = xSeconds;
             this.velocityDampingTauSecondsY = ySeconds;
             this.velocityDampingTauSecondsZ = zSeconds;
+        }
+
+        /**
+         * Sets the "still" tau floor (per axis, seconds) that {@link #predict} blends down toward as
+         * the bias/gravity-corrected world acceleration magnitude drops below {@code thresholdMps2}
+         * (m/s^2), and the "moving" ceiling set by {@link #setVelocityDampingTauSeconds} is restored
+         * once it's at or above the threshold.
+         */
+        public void setVelocityDampingStillness(double xStillSeconds, double yStillSeconds, double zStillSeconds, double thresholdMps2) {
+            this.velocityDampingTauSecondsStillX = xStillSeconds;
+            this.velocityDampingTauSecondsStillY = yStillSeconds;
+            this.velocityDampingTauSecondsStillZ = zStillSeconds;
+            this.stillnessAccelThresholdMps2 = thresholdMps2;
         }
 
         public Point3D getPosition() { return new Point3D(x[0], x[1], x[2]); }
@@ -164,6 +197,12 @@ public class UKF {
          * the result into world frame, adds gravity, then integrates position/velocity (with
          * velocity decay) and carries the bias through unchanged (it's a slow random walk,
          * modeled only via {@link #processNoise}, not driven deterministically here).
+         *
+         * <p>The velocity decay's tau is computed fresh per sigma point (not just per axis) from
+         * this same corrected/rotated/gravity-compensated acceleration: its magnitude is what's
+         * left in the signal once this sigma point's bias hypothesis and gravity are accounted
+         * for, so a magnitude near zero means "nothing here explains ongoing velocity" and tau
+         * tightens toward the still floor; see {@link #adaptiveTau}.
          */
         private double[] processModel(double[] s, double dt, Point3D sensorAccelMps2, double[][] worldRotation) {
             double correctedX = sensorAccelMps2.getX() - s[6];
@@ -175,9 +214,13 @@ public class UKF {
             double worldAz = worldRotation[2][0] * correctedX + worldRotation[2][1] * correctedY + worldRotation[2][2] * correctedZ;
             worldAy -= GRAVITY_MPS2; // gravity points down (world -Y)
 
-            double decayX = Math.exp(-dt / velocityDampingTauSecondsX);
-            double decayY = Math.exp(-dt / velocityDampingTauSecondsY);
-            double decayZ = Math.exp(-dt / velocityDampingTauSecondsZ);
+            double netAccelMag = Math.sqrt(worldAx * worldAx + worldAy * worldAy + worldAz * worldAz);
+            // 0 = "still" (no net force left to explain velocity) .. 1 = "moving" (trust the tau ceiling).
+            double stillness = clamp(netAccelMag / stillnessAccelThresholdMps2, 0.0, 1.0);
+
+            double decayX = Math.exp(-dt / adaptiveTau(velocityDampingTauSecondsStillX, velocityDampingTauSecondsX, stillness));
+            double decayY = Math.exp(-dt / adaptiveTau(velocityDampingTauSecondsStillY, velocityDampingTauSecondsY, stillness));
+            double decayZ = Math.exp(-dt / adaptiveTau(velocityDampingTauSecondsStillZ, velocityDampingTauSecondsZ, stillness));
 
             double[] out = new double[N];
             out[0] = s[0] + s[3] * dt;
@@ -190,6 +233,15 @@ public class UKF {
             out[7] = s[7];
             out[8] = s[8];
             return out;
+        }
+
+        /** Linearly blends between the still-floor and moving-ceiling tau by the 0..1 stillness weight. */
+        private static double adaptiveTau(double stillTau, double movingTau, double stillness) {
+            return stillTau + stillness * (movingTau - stillTau);
+        }
+
+        private static double clamp(double v, double lo, double hi) {
+            return Math.max(lo, Math.min(hi, v));
         }
 
         /** Discrete white-noise-acceleration process noise (pos/vel coupled per axis) plus a slow bias random walk. */
