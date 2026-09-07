@@ -9,6 +9,13 @@ import cc.briem.swift.network.models.Frame;
 import javafx.application.Application;
 
 public class App {
+
+    // Camera mount tilt, in degrees, about the camera's own right (X) axis: positive = pitched
+    // down toward the table, negative = pitched up toward the ceiling, 0 = level. Set this to
+    // match however the camera is physically angled this session — see
+    // AnalysisThread#setCameraTiltDegrees.
+    private static final double CAMERA_TILT_DEGREES = 50;
+
     public static void main(String[] args) {
 
         nu.pattern.OpenCV.loadLocally();
@@ -47,6 +54,7 @@ public class App {
 
             // Start Analysis thread (consumes frames and updates the JavaFX UI)
             AnalysisThread analysisThreadRunnable = new AnalysisThread(analyzedFrames, landmarkResults, imuController);
+            analysisThreadRunnable.setCameraTiltDegrees(CAMERA_TILT_DEGREES);
             Thread analysisThread = new Thread(analysisThreadRunnable, "Analysis Thread");
             analysisThread.setDaemon(true);
             analysisThread.start();

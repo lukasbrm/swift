@@ -9,7 +9,7 @@ public class UKF {
      * accelerometer bias.
      *
      * <p>State vector: {@code [px, py, pz, vx, vy, vz, bx, by, bz]}, in the same metric world
-     * frame as {@code AnalysisThread.M} and {@code AnalysisThread.flipYZ} (X = camera right,
+     * frame as {@code AnalysisThread.M} and {@code AnalysisThread.cameraToWorld} (X = camera right,
      * Y = up, Z = toward camera) for position/velocity; {@code bx,by,bz} is the accelerometer's
      * bias in its own sensor frame (m/s^2).
      *

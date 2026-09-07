@@ -42,6 +42,29 @@ public class AnalysisThread implements Runnable {
     private static final double PRESENCE_THRESHOLD = 0.5;  // gate for treating a CV frame as "confident"
     private static final double GRAVITY_MPS2 = 9.80665;
 
+    /**
+     * Camera mount tilt about the camera's own X (right) axis, in radians: positive = camera
+     * pitched down toward the table (forward axis dips below horizontal), negative = pitched up
+     * toward the ceiling, 0 = level. Everything else in this class ({@link #M}, gravity
+     * compensation in {@code UKF}, and {@link #yawOffsetMatrix}'s heading-only correction) assumes
+     * the camera's forward axis is horizontal — see {@link #cameraToWorld} for how this constant
+     * folds the actual mount angle back into that assumption instead of leaving it violated.
+     * Yaw (facing a different horizontal direction) is already corrected at runtime instead of
+     * needing a constant here, and roll (rotation about the optical axis) never happens on this
+     * rig, so tilt is the only mounting angle that needs to be dialed in by hand.
+     */
+    private volatile double cameraTiltRadians = 0.0;
+
+    /**
+     * Sets the camera's mount tilt — see {@link #cameraTiltRadians}. Call once after construction
+     * to match however the camera is physically angled this session (e.g. 45 when angled down at
+     * a checkerboard for occlusion testing); leave at the default 0 for a level, forward-facing
+     * mount.
+     */
+    public void setCameraTiltDegrees(double degrees) {
+        this.cameraTiltRadians = Math.toRadians(degrees);
+    }
+
     public AnalysisThread(BlockingQueue<Frame> analyzedFrames, BlockingQueue<LandmarkResult> landmarkResults, IMUController imuController) {
         this.analyzedFrames = analyzedFrames;
         this.landmarkResults = landmarkResults;
@@ -165,7 +188,7 @@ public class AnalysisThread implements Runnable {
 
         boolean confident = isConfidentDetection(handLandmarks);
         List<Point3D> absolutePoints = confident ? handLandmarks.absolutePoints : null;
-        Point3D wristWorld = confident ? flipYZ(absolutePoints.get(0)) : null;
+        Point3D wristWorld = confident ? cameraToWorld(absolutePoints.get(0)) : null;
 
         if (wristFilter == null) {
             if (!confident) {
@@ -196,14 +219,14 @@ public class AnalysisThread implements Runnable {
      *
      * <p>Offsets come from {@code handLandmarks.absolutePoints} — the hand's real absolute position
      * in camera space (solvePnP, see {@link HandLandmarks#getAbsoluteWorldPoints}) — converted to
-     * the IMU/world convention via {@link #flipYZ} so the rigid rotation in {@link #reprojectHand}
-     * lines up with {@link #worldRotationMatrix}.
+     * the IMU/world convention via {@link #cameraToWorld} so the rigid rotation in
+     * {@link #reprojectHand} lines up with {@link #worldRotationMatrix}.
      */
     private void captureReferenceShape(List<Point3D> absolutePoints, ImuPacket.Quaternion orientation, HandLandmarks handLandmarks) {
-        Point3D wristWorld = flipYZ(absolutePoints.get(0));
+        Point3D wristWorld = cameraToWorld(absolutePoints.get(0));
         List<Point3D> offsets = new ArrayList<>(absolutePoints.size());
         for (Point3D p : absolutePoints) {
-            offsets.add(flipYZ(p).subtract(wristWorld));
+            offsets.add(cameraToWorld(p).subtract(wristWorld));
         }
         this.referenceOffsets = offsets;
         this.referenceOrientation = orientation;
@@ -227,7 +250,7 @@ public class AnalysisThread implements Runnable {
         List<Point3D> absolutePoints = new ArrayList<>(referenceOffsets.size());
         for (Point3D offset : referenceOffsets) {
             Point3D worldPoint = fusedWristWorld.add(applyMatrix(delta, offset));
-            absolutePoints.add(flipYZ(worldPoint));
+            absolutePoints.add(worldToCamera(worldPoint));
         }
 
         return new HandLandmarks(absolutePoints, lastHandednessScore, lastPresenceScore);
@@ -240,14 +263,35 @@ public class AnalysisThread implements Runnable {
     }
 
     /**
-     * Converts between {@code HandLandmarks.absolutePoints}' OpenCV camera-space convention
-     * (X = right, Y = down, Z = forward/away from camera) and the IMU/world convention used for
+     * Converts a point from {@code HandLandmarks.absolutePoints}' OpenCV camera-space convention
+     * (X = right, Y = down, Z = forward/away from camera) to the IMU/world convention used for
      * accel fusion, {@link #worldRotationMatrix} and {@code AnalysisThread.M} (X = right, Y = up,
-     * Z = toward camera). A pure axis flip, and its own inverse, so the same formula converts
-     * either direction.
+     * Z = toward camera).
+     *
+     * <p>At zero tilt this is the pure axis flip {@code (x, -y, -z)} it always used to be — a 180°
+     * rotation about the shared X axis. {@link #cameraTiltRadians} generalizes that fixed 180° to
+     * {@code 180° - tilt}, which un-tilts the camera's actual forward axis back to horizontal
+     * before applying the flip, so the result is a genuinely gravity/level-referenced world frame
+     * regardless of how the camera is physically angled. Unlike the old pure flip, this is not its
+     * own inverse once tilt != 0 — see {@link #worldToCamera} for the reverse direction.
      */
-    private static Point3D flipYZ(Point3D p) {
-        return new Point3D(p.getX(), -p.getY(), -p.getZ());
+    private Point3D cameraToWorld(Point3D p) {
+        double a = Math.PI - cameraTiltRadians;
+        double c = Math.cos(a), s = Math.sin(a);
+        double x = p.getX(), y = p.getY(), z = p.getZ();
+        return new Point3D(x, c * y - s * z, s * y + c * z);
+    }
+
+    /**
+     * Inverse of {@link #cameraToWorld}: converts a fused/world-frame point back to camera space
+     * for rendering (e.g. {@link #reprojectHand}). {@link #cameraToWorld}'s matrix is a proper
+     * rotation, so its inverse is just its transpose.
+     */
+    private Point3D worldToCamera(Point3D p) {
+        double a = Math.PI - cameraTiltRadians;
+        double c = Math.cos(a), s = Math.sin(a);
+        double x = p.getX(), y = p.getY(), z = p.getZ();
+        return new Point3D(x, c * y + s * z, -s * y + c * z);
     }
 
     /**
