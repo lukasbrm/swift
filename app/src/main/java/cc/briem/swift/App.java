@@ -13,8 +13,9 @@ public class App {
     // Camera mount tilt, in degrees, about the camera's own right (X) axis: positive = pitched
     // down toward the table, negative = pitched up toward the ceiling, 0 = level. Set this to
     // match however the camera is physically angled this session — see
-    // AnalysisThread#setCameraTiltDegrees.
-    private static final double CAMERA_TILT_DEGREES = 50;
+    // AnalysisThread#setCameraTiltDegrees. Package-private (not private) so DisplayApp can record
+    // it into debug captures without needing a separate accessor.
+    static final double CAMERA_TILT_DEGREES = 55;
 
     public static void main(String[] args) {
 
@@ -32,7 +33,7 @@ public class App {
             BlockingQueue<LandmarkResult> landmarkResults = new LinkedBlockingQueue<>(64);
 
             // Instantiate IMUController for global access
-            IMUController imuController = new IMUController("/dev/tty.usbserial-210", 115200);
+            IMUController imuController = new IMUController("/dev/tty.usbserial-10", 115200);
 
             // Start network thread (receives frames)
             NetworkThread networkThreadRunnable = new NetworkThread(frameBuffer);

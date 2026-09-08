@@ -4,10 +4,10 @@ import javafx.geometry.Point2D;
 import javafx.geometry.Point3D;
 
 public class CameraIntrinsics {
-    public static final double width = 1920;
-    public static final double height = 1080;
-    public static final double fovHorizontal = 65;
-    public static final double fx = (width / 2) / Math.tan(Math.toRadians(fovHorizontal) / 2);  // ≈ 1507
+    public static final double width = 3840;
+    public static final double height = 2160;
+    public static final double fovHorizontal = 89.7;
+    public static final double fx = (width / 2) / Math.tan(Math.toRadians(fovHorizontal) / 2);  // ≈ 966
     public static final double fy = fx;
     public static final double cx = width / 2;
     public static final double cy = height / 2;

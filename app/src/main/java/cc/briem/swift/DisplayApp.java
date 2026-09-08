@@ -1,6 +1,15 @@
 package cc.briem.swift;
 
+import java.awt.image.BufferedImage;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
+
+import javax.imageio.ImageIO;
 
 import cc.briem.swift.cv.CameraIntrinsics;
 import cc.briem.swift.cv.models.HandLandmarks;
@@ -9,11 +18,16 @@ import cc.briem.swift.imu.ImuPacket;
 import javafx.application.Application;
 import javafx.geometry.Point2D;
 import javafx.geometry.Point3D;
+import javafx.scene.Node;
 import javafx.scene.Scene;
+import javafx.scene.SnapshotParameters;
 import javafx.scene.canvas.Canvas;
 import javafx.scene.canvas.GraphicsContext;
 import javafx.scene.image.Image;
 import javafx.scene.image.ImageView;
+import javafx.scene.image.PixelReader;
+import javafx.scene.image.WritableImage;
+import javafx.scene.input.KeyCode;
 import javafx.scene.layout.StackPane;
 import javafx.scene.paint.Color;
 import javafx.scene.paint.Paint;
@@ -30,6 +44,19 @@ public class DisplayApp extends Application {
 
     static volatile ImageView imageView;
     static volatile Canvas overlay;
+
+    // Debug-capture directory for 'S'-triggered screenshots + landmark dumps — see captureDebugFrame.
+    private static final Path DEBUG_CAPTURE_DIR = Paths.get("debug-captures");
+    private static final DateTimeFormatter CAPTURE_TIMESTAMP_FORMAT = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS");
+
+    // Cache of the most recently rendered frame's inputs, so the 'S' key can dump "whatever's on
+    // screen right now" without AnalysisThread having to push anything extra. Both render() (via
+    // Platform.runLater) and the key handler run on the FX thread, so no synchronization is needed
+    // beyond the volatile visibility already used for imageView/overlay above.
+    private static volatile LandmarkResult lastResult;
+    private static volatile Point3D[] lastImuNormal;
+    private static volatile Point3D[] lastGeometricNormal;
+    private static volatile TrackingState lastState;
 
     private static final double DOT_RADIUS        = 5.0;
     private static final double LINE_WIDTH        = 2.0;
@@ -75,6 +102,12 @@ public class DisplayApp extends Application {
         overlay.widthProperty().bind(scene.widthProperty());
         overlay.heightProperty().bind(scene.heightProperty());
 
+        scene.setOnKeyPressed(event -> {
+            if (event.getCode() == KeyCode.S) {
+                captureDebugFrame();
+            }
+        });
+
         primaryStage.setTitle("Swift Frame Viewer");
         primaryStage.setScene(scene);
         primaryStage.show();
@@ -87,6 +120,11 @@ public class DisplayApp extends Application {
     public static void render(Image image, LandmarkResult result, Point3D[] imuNormal, Point3D[] geometricNormal, TrackingState state) {
         if (imageView != null) imageView.setImage(image);
         drawOverlay(image, result, imuNormal, geometricNormal, state);
+
+        lastResult = result;
+        lastImuNormal = imuNormal;
+        lastGeometricNormal = geometricNormal;
+        lastState = state;
     }
 
     private static void drawOverlay(Image image, LandmarkResult result, Point3D[] imuNormal, Point3D[] geometricNormal, TrackingState state) {
@@ -98,11 +136,11 @@ public class DisplayApp extends Application {
 
         gc.clearRect(0, 0, canvasW, canvasH);
 
-        switch(state) {
+        /**switch(state) {
             case TrackingState.TRACKING -> drawText(gc, "TRACKING", Color.GREEN, 20, 40);
             case TrackingState.MISMATCH -> drawText(gc, "MISMATCH", Color.ORANGE, 20, 40);
             case TrackingState.OCCLUDED -> drawText(gc, "OCCLUDED", Color.DARKRED, 20, 40);
-        }
+        }*/
 
         // Always draw the world-axes gizmo so the coordinate assumptions are visible
         drawGizmo(gc, canvasW, canvasH);
@@ -148,10 +186,10 @@ public class DisplayApp extends Application {
             }
 
             // Draw IMU orientation arrow rooted at the wrist
-            drawArrow(gc, pts, imuNormal[handIndex], scale, offsetX, offsetY, Color.CYAN);
+            //drawArrow(gc, pts, imuNormal[handIndex], scale, offsetX, offsetY, Color.CYAN);
 
             // Draw geometric palm normal from landmarks
-            drawArrow(gc, pts, geometricNormal[handIndex], scale, offsetX, offsetY, Color.GREEN);
+            //drawArrow(gc, pts, geometricNormal[handIndex], scale, offsetX, offsetY, Color.GREEN);
 
             handIndex++;
         }
@@ -267,5 +305,123 @@ public class DisplayApp extends Application {
     private static Color depthColor(double z, double zMin, double zMax) {
         double t = Math.clamp((z - zMin) / (zMax - zMin), 0, 1);
         return Color.hsb(200 * t, 0.85, 1.0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Debug capture ('S' key): dumps the current annotated frame + its landmark data, for
+    // comparing predicted hand position against an external ground truth (e.g. a checkerboard).
+    // -------------------------------------------------------------------------
+
+    /**
+     * Snapshots the composited scene (camera frame + skeleton/arrows/gizmo overlay, exactly as
+     * currently displayed) to a PNG, and writes a same-named JSON file with the landmark data
+     * behind that frame, into {@link #DEBUG_CAPTURE_DIR}. Runs entirely on the FX thread (key
+     * events always do), matching {@link #render}, so the cached {@code last*} fields are safe to
+     * read here without extra synchronization.
+     */
+    private static void captureDebugFrame() {
+        if (overlay == null) {
+            return;
+        }
+
+        String timestamp = CAPTURE_TIMESTAMP_FORMAT.format(LocalDateTime.now());
+        try {
+            Files.createDirectories(DEBUG_CAPTURE_DIR);
+
+            Node root = overlay.getParent();
+            WritableImage snapshot = root.snapshot(new SnapshotParameters(), null);
+            Path pngPath = DEBUG_CAPTURE_DIR.resolve(timestamp + ".png");
+            writePng(snapshot, pngPath);
+
+            Path jsonPath = DEBUG_CAPTURE_DIR.resolve(timestamp + ".json");
+            writeLandmarksJson(jsonPath, timestamp);
+
+            logger.info("Saved debug capture: {} / {}", pngPath, jsonPath);
+        } catch (IOException e) {
+            logger.error("Failed to save debug capture '{}'", timestamp, e);
+        }
+    }
+
+    /**
+     * Converts a JavaFX {@link WritableImage} to a PNG file by copying pixels through a
+     * {@link BufferedImage} — no {@code javafx.swing} module (and its {@code SwingFXUtils}
+     * shortcut) is on the module path, so this is done by hand instead of pulling that in for one
+     * debug feature.
+     */
+    private static void writePng(WritableImage image, Path path) throws IOException {
+        int width = (int) Math.round(image.getWidth());
+        int height = (int) Math.round(image.getHeight());
+        BufferedImage buffered = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+        PixelReader reader = image.getPixelReader();
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                buffered.setRGB(x, y, reader.getArgb(x, y));
+            }
+        }
+        ImageIO.write(buffered, "png", path.toFile());
+    }
+
+    /**
+     * Writes the landmark data behind the current frame (per hand: the 21 fused
+     * {@code absolutePoints} in camera-space meters, handedness/presence, and normals) alongside
+     * the tracking state and current camera-tilt setting, so a capture is self-describing when
+     * revisited later. Hand-rolled (no JSON library in this project) since the schema is small and
+     * fixed.
+     */
+    private static void writeLandmarksJson(Path path, String captureTimestamp) throws IOException {
+        LandmarkResult result = lastResult;
+        Point3D[] imuNormal = lastImuNormal;
+        Point3D[] geometricNormal = lastGeometricNormal;
+        TrackingState state = lastState;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\n");
+        sb.append("  \"captureTimestamp\": \"").append(captureTimestamp).append("\",\n");
+        sb.append("  \"frameTimestamp\": \"").append(result != null ? result.getTimestamp() : "null").append("\",\n");
+        sb.append("  \"trackingState\": \"").append(state != null ? state.name() : "UNKNOWN").append("\",\n");
+        sb.append("  \"cameraTiltDegrees\": ").append(App.CAMERA_TILT_DEGREES).append(",\n");
+        sb.append("  \"hands\": [\n");
+
+        List<HandLandmarks> hands = result != null ? result.getHands() : List.of();
+        for (int h = 0; h < hands.size(); h++) {
+            HandLandmarks hand = hands.get(h);
+            sb.append("    {\n");
+            sb.append("      \"handIndex\": ").append(h).append(",\n");
+            sb.append("      \"handednessScore\": ").append(hand.handednessScore).append(",\n");
+            sb.append("      \"presenceScore\": ").append(hand.presenceScore).append(",\n");
+            appendVector(sb, "      ", "imuNormal", h < imuNormal.length ? imuNormal[h] : null, true);
+            appendVector(sb, "      ", "geometricNormal", h < geometricNormal.length ? geometricNormal[h] : null, true);
+            sb.append("      \"landmarks\": [\n");
+            List<Point3D> pts = hand.absolutePoints;
+            for (int i = 0; i < pts.size(); i++) {
+                Point3D p = pts.get(i);
+                sb.append("        { \"index\": ").append(i)
+                        .append(", \"x\": ").append(p.getX())
+                        .append(", \"y\": ").append(p.getY())
+                        .append(", \"z\": ").append(p.getZ())
+                        .append(" }").append(i < pts.size() - 1 ? "," : "").append("\n");
+            }
+            sb.append("      ]\n");
+            sb.append("    }").append(h < hands.size() - 1 ? "," : "").append("\n");
+        }
+
+        sb.append("  ]\n");
+        sb.append("}\n");
+
+        Files.writeString(path, sb.toString());
+    }
+
+    /** Appends {@code "name": {"x":..,"y":..,"z":..}} (or {@code null}) at the given indent. */
+    private static void appendVector(StringBuilder sb, String indent, String name, Point3D v, boolean trailingComma) {
+        sb.append(indent).append("\"").append(name).append("\": ");
+        if (v == null) {
+            sb.append("null");
+        } else {
+            sb.append("{ \"x\": ").append(v.getX())
+                    .append(", \"y\": ").append(v.getY())
+                    .append(", \"z\": ").append(v.getZ())
+                    .append(" }");
+        }
+        sb.append(trailingComma ? ",\n" : "\n");
     }
 }
