@@ -188,7 +188,7 @@ public class AnalysisThread implements Runnable {
 
         boolean confident = isConfidentDetection(handLandmarks);
         List<Point3D> absolutePoints = confident ? handLandmarks.absolutePoints : null;
-        Point3D wristWorld = confident ? cameraToWorld(absolutePoints.get(0)) : null;
+        Point3D wristWorld = confident ? cameraToWorld(absolutePoints.get(0), cameraTiltRadians) : null;
 
         if (wristFilter == null) {
             if (!confident) {
@@ -223,10 +223,10 @@ public class AnalysisThread implements Runnable {
      * {@link #reprojectHand} lines up with {@link #worldRotationMatrix}.
      */
     private void captureReferenceShape(List<Point3D> absolutePoints, ImuPacket.Quaternion orientation, HandLandmarks handLandmarks) {
-        Point3D wristWorld = cameraToWorld(absolutePoints.get(0));
+        Point3D wristWorld = cameraToWorld(absolutePoints.get(0), cameraTiltRadians);
         List<Point3D> offsets = new ArrayList<>(absolutePoints.size());
         for (Point3D p : absolutePoints) {
-            offsets.add(cameraToWorld(p).subtract(wristWorld));
+            offsets.add(cameraToWorld(p, cameraTiltRadians).subtract(wristWorld));
         }
         this.referenceOffsets = offsets;
         this.referenceOrientation = orientation;
@@ -250,7 +250,7 @@ public class AnalysisThread implements Runnable {
         List<Point3D> absolutePoints = new ArrayList<>(referenceOffsets.size());
         for (Point3D offset : referenceOffsets) {
             Point3D worldPoint = fusedWristWorld.add(applyMatrix(delta, offset));
-            absolutePoints.add(worldToCamera(worldPoint));
+            absolutePoints.add(worldToCamera(worldPoint, cameraTiltRadians));
         }
 
         return new HandLandmarks(absolutePoints, lastHandednessScore, lastPresenceScore);
@@ -269,14 +269,22 @@ public class AnalysisThread implements Runnable {
      * Z = toward camera).
      *
      * <p>At zero tilt this is the pure axis flip {@code (x, -y, -z)} it always used to be — a 180°
-     * rotation about the shared X axis. {@link #cameraTiltRadians} generalizes that fixed 180° to
-     * {@code 180° - tilt}, which un-tilts the camera's actual forward axis back to horizontal
-     * before applying the flip, so the result is a genuinely gravity/level-referenced world frame
-     * regardless of how the camera is physically angled. Unlike the old pure flip, this is not its
-     * own inverse once tilt != 0 — see {@link #worldToCamera} for the reverse direction.
+     * rotation about the shared X axis. {@code tiltRadians} (see {@link #cameraTiltRadians})
+     * generalizes that fixed 180° to {@code 180° - tilt}, which un-tilts the camera's actual
+     * forward axis back to horizontal before applying the flip, so the result is a genuinely
+     * gravity/level-referenced world frame regardless of how the camera is physically angled.
+     * Unlike the old pure flip, this is not its own inverse once tilt != 0 — see
+     * {@link #worldToCamera} for the reverse direction.
+     *
+     * <p>Pure rotation about the origin, not a translation: the returned point keeps whatever
+     * origin {@code p} had (typically the camera's optical center) — it does not shift to a
+     * table- or scene-relative origin.
+     *
+     * @param p           point in camera space
+     * @param tiltRadians camera mount tilt in radians, see {@link #cameraTiltRadians}
      */
-    private Point3D cameraToWorld(Point3D p) {
-        double a = Math.PI - cameraTiltRadians;
+    public static Point3D cameraToWorld(Point3D p, double tiltRadians) {
+        double a = Math.PI - tiltRadians;
         double c = Math.cos(a), s = Math.sin(a);
         double x = p.getX(), y = p.getY(), z = p.getZ();
         return new Point3D(x, c * y - s * z, s * y + c * z);
@@ -286,9 +294,12 @@ public class AnalysisThread implements Runnable {
      * Inverse of {@link #cameraToWorld}: converts a fused/world-frame point back to camera space
      * for rendering (e.g. {@link #reprojectHand}). {@link #cameraToWorld}'s matrix is a proper
      * rotation, so its inverse is just its transpose.
+     *
+     * @param p           point in world space
+     * @param tiltRadians camera mount tilt in radians, see {@link #cameraTiltRadians}
      */
-    private Point3D worldToCamera(Point3D p) {
-        double a = Math.PI - cameraTiltRadians;
+    public static Point3D worldToCamera(Point3D p, double tiltRadians) {
+        double a = Math.PI - tiltRadians;
         double c = Math.cos(a), s = Math.sin(a);
         double x = p.getX(), y = p.getY(), z = p.getZ();
         return new Point3D(x, c * y + s * z, -s * y + c * z);

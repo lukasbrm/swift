@@ -75,6 +75,11 @@ public class DisplayApp extends Application {
     private static final Color  GIZMO_Y_COLOR    = Color.LIMEGREEN;
     private static final Color  GIZMO_Z_COLOR    = Color.DODGERBLUE;
 
+    // Landmark-0 (wrist) coordinate readout, pinned to the top-right corner
+    private static final double LANDMARK0_MARGIN_X = 12.0;  // px from right
+    private static final double LANDMARK0_MARGIN_Y = 24.0;  // px from top
+    private static final Color  LANDMARK0_COLOR     = Color.BLACK;
+
     // MediaPipe hand skeleton: chains of landmark indices per finger, plus the palm bar.
     private static final int[][] CONNECTIONS = {
         {0, 1, 2, 3, 4},
@@ -144,6 +149,9 @@ public class DisplayApp extends Application {
 
         // Always draw the world-axes gizmo so the coordinate assumptions are visible
         drawGizmo(gc, canvasW, canvasH);
+
+        // Always show Landmark 0's coordinates, even when no hand is currently tracked
+        drawLandmark0Coords(gc, canvasW, result);
 
         if (result == null || result.getHands().isEmpty()) return;
 
@@ -241,10 +249,33 @@ public class DisplayApp extends Application {
         gc.fillText("+Z", ox + r + 4, oy + 4);
 
         // "world" label below the origin
-        gc.setFill(Color.WHITE);
+        gc.setFill(Color.BLACK);
         gc.setFont(Font.font("SansSerif", FontWeight.NORMAL, 10));
         gc.fillText("world", ox - 10, oy + 20);
 
+        gc.restore();
+    }
+
+    /**
+     * Draws Landmark 0's (the wrist's) camera-space coordinates, right-aligned in the top-right
+     * corner of the canvas. Shown at all times, including when no hand is currently tracked, so
+     * the readout doesn't disappear mid-session.
+     */
+    private static void drawLandmark0Coords(GraphicsContext gc, double canvasW, LandmarkResult result) {
+        String text;
+        if (result == null || result.getHands().isEmpty()) {
+            text = "L0: no hand";
+        } else {
+            Point3D p = result.getHands().get(0).absolutePoints.get(0);
+            Point3D p0 = AnalysisThread.cameraToWorld(p, Math.toRadians(App.CAMERA_TILT_DEGREES));
+            text = String.format("L0: x=%.3f y=%.3f z=%.3f", p0.getX(), p0.getY(), p0.getZ());
+        }
+
+        gc.save();
+        gc.setFont(Font.font("Monospaced", FontWeight.BOLD, 14));
+        gc.setFill(LANDMARK0_COLOR);
+        gc.setTextAlign(javafx.scene.text.TextAlignment.RIGHT);
+        gc.fillText(text, canvasW - LANDMARK0_MARGIN_X, LANDMARK0_MARGIN_Y);
         gc.restore();
     }
 

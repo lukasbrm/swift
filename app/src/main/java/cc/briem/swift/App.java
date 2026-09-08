@@ -15,7 +15,7 @@ public class App {
     // match however the camera is physically angled this session — see
     // AnalysisThread#setCameraTiltDegrees. Package-private (not private) so DisplayApp can record
     // it into debug captures without needing a separate accessor.
-    static final double CAMERA_TILT_DEGREES = 55;
+    public static final double CAMERA_TILT_DEGREES = 35;
 
     public static void main(String[] args) {
 
